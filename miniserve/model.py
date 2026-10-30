@@ -4,7 +4,7 @@ MiniServe 的 GPT-2 模型（从零实现）。
 按地图从小往大写，每写完一个类就运行检查：
     python tests/check_model.py
 
-当前进度：第 1 步 CausalSelfAttention ✅  第 2 步 MLP ✅  第 3 步 Block
+当前进度：第 1 步 ✅  第 2 步 ✅  第 3 步 ✅  第 4 步 GPT2
 """
 import math
 from dataclasses import dataclass
@@ -78,7 +78,7 @@ class MLP(nn.Module):
         # TODO 三步：c_fc -> GELU -> c_proj
         #   GELU 用 F.gelu(..., approximate="tanh")
         return self.c_proj(F.gelu(self.c_fc(x),approximate = "tanh"))
-        
+
 
 
 # ---------------------------------------------------------------------------
@@ -93,10 +93,46 @@ class Block(nn.Module):
         self.ln_1 = nn.LayerNorm(config.n_embd)
         # TODO 再定义 3 个零件：self.attn、self.ln_2、self.mlp
         #   提示：attn 和 mlp 就是你写好的 CausalSelfAttention 和 MLP，也是传 config 来创建
-        self.attn = None
-        self.ln_2 = None
-        self.mlp = None
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = MLP(config)
 
     def forward(self, x):
         # TODO 两行，照着上面注释里的公式写
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+# ---------------------------------------------------------------------------
+# 第 4 步：完整的 GPT-2
+#   idx (B, T)：token id（整数）
+#     -> wte(idx) + wpe(位置)        (B, T, C)
+#     -> 12 个 Block                 (B, T, C)
+#     -> ln_f                        (B, T, C)
+#     -> lm_head                     (B, T, vocab_size)   每个位置对词表里每个词的打分
+# ---------------------------------------------------------------------------
+class GPT2(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        # nn.Embedding(行数, 每行维度)：一张查找表，wte(idx) 就是按 idx 取出对应的行
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+        # TODO wpe：位置嵌入表，行数是最大序列长度 block_size
+        self.wpe = None
+        # nn.ModuleList：装多个模块的列表（普通 list 的话 PyTorch 找不到里面的参数）
+        self.h = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        # TODO ln_f：最后一个 LayerNorm
+        self.ln_f = None
+        # lm_head：768 -> vocab_size，GPT-2 的 lm_head 没有 bias
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # TODO weight tying：让 lm_head 和 wte 用同一份权重（一行赋值）
+
+    def forward(self, idx):
+        B, T = idx.size()
+        # TODO
+        #   ① 位置编号 pos = 0, 1, ..., T-1     提示：torch.arange，别忘了 device=idx.device
+        #   ② x = 词嵌入 + 位置嵌入             (B, T, C) + (T, C) 会自动广播
+        #   ③ 依次经过 self.h 里的每个 Block    提示：for 循环
+        #   ④ 经过 self.ln_f
+        #   ⑤ logits = self.lm_head(x)，返回 logits
         raise NotImplementedError

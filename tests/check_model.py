@@ -90,6 +90,15 @@ def copy_layernorm(dst, src):
         dst.bias.copy_(src.bias)
 
 
+def copy_block(dst, src):
+    copy_layernorm(dst.ln_1, src.ln_1)
+    copy_linear(dst.attn.c_attn, src.attn.c_attn)
+    copy_linear(dst.attn.c_proj, src.attn.c_proj)
+    copy_layernorm(dst.ln_2, src.ln_2)
+    copy_linear(dst.mlp.c_fc, src.mlp.c_fc)
+    copy_linear(dst.mlp.c_proj, src.mlp.c_proj)
+
+
 def check_block(hf):
     cfg = M.GPTConfig()
     block = M.Block(cfg)
@@ -97,18 +106,14 @@ def check_block(hf):
                       ("ln_2", torch.nn.LayerNorm), ("mlp", M.MLP)]:
         assert isinstance(getattr(block, name), cls), f"self.{name} 还没定义成 {cls.__name__}"
     src = hf.transformer.h[0]
-    copy_layernorm(block.ln_1, src.ln_1)
-    copy_linear(block.attn.c_attn, src.attn.c_attn)
-    copy_linear(block.attn.c_proj, src.attn.c_proj)
-    copy_layernorm(block.ln_2, src.ln_2)
-    copy_linear(block.mlp.c_fc, src.mlp.c_fc)
-    copy_linear(block.mlp.c_proj, src.mlp.c_proj)
+    copy_block(block, src)
 
     x = torch.randn(2, 7, cfg.n_embd)
     with torch.no_grad():
         got = block(x)
         want = src(x)
         want = want[0] if isinstance(want, tuple) else want
+    assert isinstance(got, torch.Tensor), f"forward 没有返回结果（得到的是 {type(got).__name__}），是不是忘了 return？"
     try:
         return compare("Block 输出", got, want)
     except AssertionError as e:
@@ -116,10 +121,43 @@ def check_block(hf):
                              "有没有加回残差 x？ln_1/ln_2 有没有用反？") from None
 
 
+def check_gpt2(hf):
+    cfg = M.GPTConfig()
+    model = M.GPT2(cfg)
+    assert isinstance(model.wpe, torch.nn.Embedding), "self.wpe 还没定义成 nn.Embedding"
+    assert tuple(model.wpe.weight.shape) == (cfg.block_size, cfg.n_embd), (
+        f"wpe 的形状应为 ({cfg.block_size}, {cfg.n_embd})，实际是 {tuple(model.wpe.weight.shape)}"
+    )
+    assert isinstance(model.ln_f, torch.nn.LayerNorm), "self.ln_f 还没定义成 nn.LayerNorm"
+    assert model.lm_head.weight is model.wte.weight, "lm_head 和 wte 还没有共享权重（weight tying）"
+    n_params = sum(p.numel() for p in model.parameters())
+    assert n_params == 124_439_808, f"参数量应为 124,439,808，实际是 {n_params:,}"
+
+    t = hf.transformer
+    with torch.no_grad():
+        model.wte.weight.copy_(t.wte.weight)  # lm_head 共享这份权重，不用单独拷
+        model.wpe.weight.copy_(t.wpe.weight)
+    for dst, src in zip(model.h, t.h):
+        copy_block(dst, src)
+    copy_layernorm(model.ln_f, t.ln_f)
+
+    idx = torch.randint(0, cfg.vocab_size, (2, 9))
+    with torch.no_grad():
+        got = model(idx)
+        want = hf(idx).logits
+    assert isinstance(got, torch.Tensor), f"forward 没有返回结果（得到的是 {type(got).__name__}），是不是忘了 return？"
+    try:
+        return compare("logits", got, want)
+    except AssertionError as e:
+        raise AssertionError(f"{e}。逐项检查：有没有加位置嵌入？每个 Block 都用上了吗？"
+                             "ln_f 有没有在 lm_head 之前？") from None
+
+
 STEPS = [
     ("第 1 步 CausalSelfAttention", check_attention),
     ("第 2 步 MLP", check_mlp),
     ("第 3 步 Block", check_block),
+    ("第 4 步 GPT2", check_gpt2),
 ]
 
 
