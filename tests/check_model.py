@@ -83,9 +83,43 @@ def check_mlp(hf):
         raise
 
 
+def copy_layernorm(dst, src):
+    """LayerNorm 的 weight 和 bias 都是一维 (768,)，直接拷贝，不用转置。"""
+    with torch.no_grad():
+        dst.weight.copy_(src.weight)
+        dst.bias.copy_(src.bias)
+
+
+def check_block(hf):
+    cfg = M.GPTConfig()
+    block = M.Block(cfg)
+    for name, cls in [("ln_1", torch.nn.LayerNorm), ("attn", M.CausalSelfAttention),
+                      ("ln_2", torch.nn.LayerNorm), ("mlp", M.MLP)]:
+        assert isinstance(getattr(block, name), cls), f"self.{name} 还没定义成 {cls.__name__}"
+    src = hf.transformer.h[0]
+    copy_layernorm(block.ln_1, src.ln_1)
+    copy_linear(block.attn.c_attn, src.attn.c_attn)
+    copy_linear(block.attn.c_proj, src.attn.c_proj)
+    copy_layernorm(block.ln_2, src.ln_2)
+    copy_linear(block.mlp.c_fc, src.mlp.c_fc)
+    copy_linear(block.mlp.c_proj, src.mlp.c_proj)
+
+    x = torch.randn(2, 7, cfg.n_embd)
+    with torch.no_grad():
+        got = block(x)
+        want = src(x)
+        want = want[0] if isinstance(want, tuple) else want
+    try:
+        return compare("Block 输出", got, want)
+    except AssertionError as e:
+        raise AssertionError(f"{e}。逐项检查：每个子模块前有没有先过 LayerNorm？"
+                             "有没有加回残差 x？ln_1/ln_2 有没有用反？") from None
+
+
 STEPS = [
     ("第 1 步 CausalSelfAttention", check_attention),
     ("第 2 步 MLP", check_mlp),
+    ("第 3 步 Block", check_block),
 ]
 
 

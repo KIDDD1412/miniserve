@@ -4,7 +4,7 @@ MiniServe 的 GPT-2 模型（从零实现）。
 按地图从小往大写，每写完一个类就运行检查：
     python tests/check_model.py
 
-当前进度：第 1 步 CausalSelfAttention ✅  第 2 步 MLP
+当前进度：第 1 步 CausalSelfAttention ✅  第 2 步 MLP ✅  第 3 步 Block
 """
 import math
 from dataclasses import dataclass
@@ -35,8 +35,6 @@ class CausalSelfAttention(nn.Module):
         # c_attn：一次算出 q、k、v，就是练习 1 的 w_qkv（多了一个 bias）
         # nn.Linear(输入维度, 输出维度)，调用 self.c_attn(x) 等价于 x @ W + b
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-
-        # TODO c_proj：输出投影，(B, T, 768) -> (B, T, 768)，照着上面一行写
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
     def forward(self, x):
         B, T, C = x.size()
@@ -52,7 +50,6 @@ class CausalSelfAttention(nn.Module):
         y = attn @ v
         y= y.transpose(1, 2).contiguous().view(B, T, C)
         return self.c_proj(y)
-        # TODO 按展开图一步步写，可以从你的练习 1~5 搬代码过来：
         #   ① qkv = self.c_attn(x)                   (B, T, 3C)
         #   ② 拆成 q, k, v                            各 (B, T, C)
         #   ③ 拆头                                    各 (B, nh, T, hs)
@@ -74,11 +71,32 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        # TODO 定义 self.c_fc 和 self.c_proj 两个 nn.Linear（输入、输出维度看上面的注释）
-        self.c_fc = None
-        self.c_proj = None
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
 
     def forward(self, x):
         # TODO 三步：c_fc -> GELU -> c_proj
         #   GELU 用 F.gelu(..., approximate="tanh")
+        return self.c_proj(F.gelu(self.c_fc(x),approximate = "tanh"))
+        
+
+
+# ---------------------------------------------------------------------------
+# 第 3 步：Block（对应地图上的 h.N，GPT-2 一共 12 个）
+#   x = x + attn( ln_1(x) )
+#   x = x + mlp ( ln_2(x) )
+# ---------------------------------------------------------------------------
+class Block(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # LayerNorm 也是一个带参数的对象（weight 和 bias 各 768 维），用法和 nn.Linear 一样
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        # TODO 再定义 3 个零件：self.attn、self.ln_2、self.mlp
+        #   提示：attn 和 mlp 就是你写好的 CausalSelfAttention 和 MLP，也是传 config 来创建
+        self.attn = None
+        self.ln_2 = None
+        self.mlp = None
+
+    def forward(self, x):
+        # TODO 两行，照着上面注释里的公式写
         raise NotImplementedError
