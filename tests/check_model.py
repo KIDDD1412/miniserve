@@ -153,11 +153,35 @@ def check_gpt2(hf):
                              "ln_f 有没有在 lm_head 之前？") from None
 
 
+def check_from_pretrained(hf):
+    model = M.from_pretrained(HF_NAME)
+    assert isinstance(model, M.GPT2), f"from_pretrained 应该返回 GPT2 模型，实际是 {type(model).__name__}"
+
+    # 逐个参数和 HF 对比，找出第一个没拷对的
+    hf_sd = hf.state_dict()
+    conv1d = ("attn.c_attn.weight", "attn.c_proj.weight", "mlp.c_fc.weight", "mlp.c_proj.weight")
+    for key, mine in model.state_dict().items():
+        hf_key = key if key == "lm_head.weight" else "transformer." + key
+        want = hf_sd[hf_key].t() if key.endswith(conv1d) else hf_sd[hf_key]
+        if torch.equal(mine, want):
+            continue
+        if mine.shape == want.shape and torch.equal(mine, want.t()):
+            raise AssertionError(f"参数 {key} 忘了转置（它是 768×768 的方阵，形状一样所以没报错）")
+        raise AssertionError(f"参数 {key} 和 HF 不一致：是不是没拷进去，或者名字没对上？")
+
+    idx = torch.randint(0, model.config.vocab_size, (2, 9))
+    with torch.no_grad():
+        got = model(idx)
+        want = hf(idx).logits
+    return compare("logits", got, want)
+
+
 STEPS = [
     ("第 1 步 CausalSelfAttention", check_attention),
     ("第 2 步 MLP", check_mlp),
     ("第 3 步 Block", check_block),
     ("第 4 步 GPT2", check_gpt2),
+    ("第 5a 步 from_pretrained", check_from_pretrained),
 ]
 
 

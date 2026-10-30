@@ -4,7 +4,7 @@ MiniServe 的 GPT-2 模型（从零实现）。
 按地图从小往大写，每写完一个类就运行检查：
     python tests/check_model.py
 
-当前进度：第 1 步 ✅  第 2 步 ✅  第 3 步 ✅  第 4 步 GPT2
+当前进度：第 1~4 步 ✅  第 5a 步 from_pretrained
 """
 import math
 from dataclasses import dataclass
@@ -118,15 +118,15 @@ class GPT2(nn.Module):
         # nn.Embedding(行数, 每行维度)：一张查找表，wte(idx) 就是按 idx 取出对应的行
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         # TODO wpe：位置嵌入表，行数是最大序列长度 block_size
-        self.wpe = None
+        self.wpe = nn.Embedding(config.block_size, config.n_embd)
         # nn.ModuleList：装多个模块的列表（普通 list 的话 PyTorch 找不到里面的参数）
         self.h = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         # TODO ln_f：最后一个 LayerNorm
-        self.ln_f = None
+        self.ln_f = nn.LayerNorm(config.n_embd)
         # lm_head：768 -> vocab_size，GPT-2 的 lm_head 没有 bias
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # TODO weight tying：让 lm_head 和 wte 用同一份权重（一行赋值）
-
+        self.lm_head.weight = self.wte.weight
     def forward(self, idx):
         B, T = idx.size()
         # TODO
@@ -135,4 +135,37 @@ class GPT2(nn.Module):
         #   ③ 依次经过 self.h 里的每个 Block    提示：for 循环
         #   ④ 经过 self.ln_f
         #   ⑤ logits = self.lm_head(x)，返回 logits
-        raise NotImplementedError
+        pos = torch.arange(T, device = idx.device)
+        x = self.wte(idx) + self.wpe(pos)
+        for block in self.h:
+            x = block(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        return logits
+
+
+# ---------------------------------------------------------------------------
+# 第 5a 步：加载 HF 的预训练权重
+#   state_dict()：模型的"参数字典"，名字 -> 张量
+#   名字就是属性路径，比如你的 self.h[0].attn.c_attn.weight 叫 "h.0.attn.c_attn.weight"
+#   HF 的名字多一个前缀，比如 "transformer.h.0.attn.c_attn.weight"
+# ---------------------------------------------------------------------------
+def from_pretrained(hf_name="openai-community/gpt2"):
+    from transformers import GPT2LMHeadModel
+
+    model = GPT2(GPTConfig())
+    sd = model.state_dict()                                          # 你的模型：名字 -> 张量
+    hf_sd = GPT2LMHeadModel.from_pretrained(hf_name).state_dict()    # HF 的模型：名字 -> 张量
+
+    # 这 4 种权重需要转置：HF 的 Conv1D 存的是 (in, out)，nn.Linear 存的是 (out, in)
+    transposed = ("attn.c_attn.weight", "attn.c_proj.weight", "mlp.c_fc.weight", "mlp.c_proj.weight")
+
+    with torch.no_grad():
+        for hf_key, hf_tensor in hf_sd.items():
+            # TODO 对 HF 的每一个参数：
+            #   ① 如果是 "lm_head.weight"，跳过（它和 wte 共享，拷 wte 时已经一起拷好了）  提示：continue
+            #   ② 把 HF 的名字变成你的名字：去掉开头的 "transformer."                        提示：str.removeprefix
+            #   ③ 名字以 transposed 中的任意一个结尾 -> 拷贝 hf_tensor.t()，否则直接拷贝 hf_tensor
+            #      提示：str.endswith 可以直接传一个元组；拷贝用 sd[key].copy_(...)
+            pass
+    return model
