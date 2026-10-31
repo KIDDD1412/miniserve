@@ -4,7 +4,7 @@ MiniServe 的 GPT-2 模型（从零实现）。
 按地图从小往大写，每写完一个类就运行检查：
     python tests/check_model.py
 
-当前进度：第 1~4 步 ✅  第 5a 步 from_pretrained
+当前进度：第 1~5a 步 ✅  第 5b 步 generate
 """
 import math
 from dataclasses import dataclass
@@ -167,5 +167,29 @@ def from_pretrained(hf_name="openai-community/gpt2"):
             #   ② 把 HF 的名字变成你的名字：去掉开头的 "transformer."                        提示：str.removeprefix
             #   ③ 名字以 transposed 中的任意一个结尾 -> 拷贝 hf_tensor.t()，否则直接拷贝 hf_tensor
             #      提示：str.endswith 可以直接传一个元组；拷贝用 sd[key].copy_(...)
-            pass
+            if hf_key == "lm_head.weight":
+                continue
+            key = hf_key.removeprefix("transformer.")
+            if key.endswith(transposed):
+                sd[key].copy_(hf_tensor.t())
+            else:
+                sd[key].copy_(hf_tensor)
+
+
     return model
+# ---------------------------------------------------------------------------
+# 第 5b 步：生成文字（贪心解码）
+#   每一步：把目前为止的整个序列送进模型 -> 取最后一个位置的打分 -> 选分数最高的词 -> 接到序列末尾
+#   @torch.no_grad()：告诉 PyTorch 这里只推理不训练，不用记录梯度（更快、更省显存）
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def generate(model, idx, max_new_tokens):
+    """idx: (B, T) 的 token id  ->  返回 (B, T + max_new_tokens)"""
+    for _ in range(max_new_tokens):
+        # TODO 四步：
+        #   ① logits = model(idx)                          (B, T, vocab_size)
+        #   ② 只取最后一个位置的打分                        (B, vocab_size)    提示：切片 [:, -1, :]
+        #   ③ 选出分数最高的词 next_id                      (B, 1)             提示：argmax(dim=-1, keepdim=True)
+        #   ④ 把 next_id 拼到 idx 后面，得到新的 idx        (B, T+1)           提示：torch.cat，想想沿哪一维
+        pass
+    return idx

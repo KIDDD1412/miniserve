@@ -176,12 +176,37 @@ def check_from_pretrained(hf):
     return compare("logits", got, want)
 
 
+def check_generate(hf):
+    from transformers import GPT2TokenizerFast
+
+    tok = GPT2TokenizerFast.from_pretrained(HF_NAME)
+    prompt = "Hello, I'm a language model,"
+    idx = tok(prompt, return_tensors="pt").input_ids
+    n_new = 20
+
+    model = M.from_pretrained(HF_NAME)
+    got = M.generate(model, idx, n_new)
+    with torch.no_grad():
+        want = hf.generate(idx, max_new_tokens=n_new, do_sample=False, pad_token_id=tok.eos_token_id)
+
+    assert isinstance(got, torch.Tensor), f"generate 应该返回 Tensor，实际是 {type(got).__name__}"
+    assert got.shape == want.shape, (
+        f"形状应为 {tuple(want.shape)}（原来 {idx.shape[1]} 个 token + 新生成 {n_new} 个），实际是 {tuple(got.shape)}"
+    )
+    print(f"         你的模型：{tok.decode(got[0])!r}")
+    print(f"         HF 模型 ：{tok.decode(want[0])!r}")
+    diff = (got[0] != want[0]).nonzero()
+    assert len(diff) == 0, f"从第 {diff[0].item()} 个 token 开始和 HF 不一样"
+    return 0.0
+
+
 STEPS = [
     ("第 1 步 CausalSelfAttention", check_attention),
     ("第 2 步 MLP", check_mlp),
     ("第 3 步 Block", check_block),
     ("第 4 步 GPT2", check_gpt2),
     ("第 5a 步 from_pretrained", check_from_pretrained),
+    ("第 5b 步 generate（与 HF 逐 token 对齐）", check_generate),
 ]
 
 
@@ -202,7 +227,8 @@ def main():
             print(f"[ERROR ] {label}：{type(e).__name__}: {e}")
             break
         else:
-            print(f"[ PASS ] {label}（与 HF 最大相对误差 {err:.1e}）")
+            detail = "" if check is check_generate else f"（与 HF 最大相对误差 {err:.1e}）"
+            print(f"[ PASS ] {label}{detail}")
 
 
 if __name__ == "__main__":
