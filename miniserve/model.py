@@ -191,5 +191,7 @@ def generate(model, idx, max_new_tokens):
         #   ② 只取最后一个位置的打分                        (B, vocab_size)    提示：切片 [:, -1, :]
         #   ③ 选出分数最高的词 next_id                      (B, 1)             提示：argmax(dim=-1, keepdim=True)
         #   ④ 把 next_id 拼到 idx 后面，得到新的 idx        (B, T+1)           提示：torch.cat，想想沿哪一维
-        pass
+        logits = model(idx)
+        next_id = logits[:, -1, :].argmax(dim = -1, keepdim = True)
+        idx = torch.cat([idx,next_id], dim = -1)
     return idx
