@@ -4,7 +4,7 @@ MiniServe 的 GPT-2 模型（从零实现）。
 按地图从小往大写，每写完一个类就运行检查：
     python tests/check_model.py
 
-当前进度：第 1~5a 步 ✅  第 5b 步 generate
+当前进度：M0 ✅  M1 第 1~3 步 ✅  M1 第 4 步 generate_cached
 """
 import math
 from dataclasses import dataclass
@@ -53,7 +53,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
 
-    # TODO（M1 第 2 步）给 forward 加上缓存：
+    # （M1 第 2 步）给 forward 加上缓存：
     #   ① 签名改成 def forward(self, x, cache=None)：不传 cache 时行为和原来完全一样
     #   ② 拆完头、得到 k, v 之后：
     #        如果 cache 不是 None：
@@ -84,15 +84,6 @@ class CausalSelfAttention(nn.Module):
         y = attn @ v
         y= y.transpose(1, 2).contiguous().view(B, T, C)
         return self.c_proj(y)
-        #   ① qkv = self.c_attn(x)                   (B, T, 3C)
-        #   ② 拆成 q, k, v                            各 (B, T, C)
-        #   ③ 拆头                                    各 (B, nh, T, hs)
-        #   ④ 注意力分数                              (B, nh, T, T)
-        #   ⑤ 因果 mask + softmax                     (B, nh, T, T)
-        #   ⑥ 乘 v                                    (B, nh, T, hs)
-        #   ⑦ 合并头                                  (B, T, C)
-        #   ⑧ 输出投影 self.c_proj                    (B, T, C)
-        # 注意：头数用 self.n_head，尺寸一律从 x 的形状里取，不要写死数字
 
 
 
@@ -109,7 +100,7 @@ class MLP(nn.Module):
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
 
     def forward(self, x):
-        # TODO 三步：c_fc -> GELU -> c_proj
+        # 三步：c_fc -> GELU -> c_proj
         #   GELU 用 F.gelu(..., approximate="tanh")
         return self.c_proj(F.gelu(self.c_fc(x),approximate = "tanh"))
 
@@ -125,16 +116,16 @@ class Block(nn.Module):
         super().__init__()
         # LayerNorm 也是一个带参数的对象（weight 和 bias 各 768 维），用法和 nn.Linear 一样
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        # TODO 再定义 3 个零件：self.attn、self.ln_2、self.mlp
+        # 再定义 3 个零件：self.attn、self.ln_2、self.mlp
         #   提示：attn 和 mlp 就是你写好的 CausalSelfAttention 和 MLP，也是传 config 来创建
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
     # TODO（M1 第 3 步）签名改成 forward(self, x, cache=None)，把 cache 原样传给 self.attn
-    def forward(self, x):
-        # TODO 两行，照着上面注释里的公式写
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, cache=None):
+        # 两行，照着上面注释里的公式写
+        x = x + self.attn(self.ln_1(x), cache = cache)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -152,15 +143,15 @@ class GPT2(nn.Module):
         self.config = config
         # nn.Embedding(行数, 每行维度)：一张查找表，wte(idx) 就是按 idx 取出对应的行
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
-        # TODO wpe：位置嵌入表，行数是最大序列长度 block_size
+        # wpe：位置嵌入表，行数是最大序列长度 block_size
         self.wpe = nn.Embedding(config.block_size, config.n_embd)
         # nn.ModuleList：装多个模块的列表（普通 list 的话 PyTorch 找不到里面的参数）
         self.h = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-        # TODO ln_f：最后一个 LayerNorm
+        # ln_f：最后一个 LayerNorm
         self.ln_f = nn.LayerNorm(config.n_embd)
         # lm_head：768 -> vocab_size，GPT-2 的 lm_head 没有 bias
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # TODO weight tying：让 lm_head 和 wte 用同一份权重（一行赋值）
+        # weight tying：让 lm_head 和 wte 用同一份权重（一行赋值）
         self.lm_head.weight = self.wte.weight
 
     # TODO（M1 第 3 步）给整个模型加上缓存：
@@ -171,18 +162,17 @@ class GPT2(nn.Module):
     #        pos = torch.arange(past, past + T, device=idx.device)
     #   ③ 第 i 个 Block 用第 i 层的缓存：block(x, cache=...)
     #        提示：for i, block in enumerate(self.h)；没传 kv_cache 时每层都传 None
-    def forward(self, idx):
+    def forward(self, idx, kv_cache = None):
         B, T = idx.size()
-        # TODO
-        #   ① 位置编号 pos = 0, 1, ..., T-1     提示：torch.arange，别忘了 device=idx.device
-        #   ② x = 词嵌入 + 位置嵌入             (B, T, C) + (T, C) 会自动广播
-        #   ③ 依次经过 self.h 里的每个 Block    提示：for 循环
-        #   ④ 经过 self.ln_f
-        #   ⑤ logits = self.lm_head(x)，返回 logits
-        pos = torch.arange(T, device = idx.device)
+        if kv_cache is not None and kv_cache[0].k is not None:
+            past = kv_cache[0].k.size(2)
+        else:
+            past = 0
+        pos = torch.arange(past, past + T, device = idx.device)
         x = self.wte(idx) + self.wpe(pos)
-        for block in self.h:
-            x = block(x)
+        for i, block in enumerate(self.h):
+            layer_cache = None if kv_cache is None else kv_cache[i]
+            x = block(x, cache = layer_cache)
         x = self.ln_f(x)
         logits = self.lm_head(x)
         return logits
@@ -206,11 +196,6 @@ def from_pretrained(hf_name="openai-community/gpt2"):
 
     with torch.no_grad():
         for hf_key, hf_tensor in hf_sd.items():
-            # TODO 对 HF 的每一个参数：
-            #   ① 如果是 "lm_head.weight"，跳过（它和 wte 共享，拷 wte 时已经一起拷好了）  提示：continue
-            #   ② 把 HF 的名字变成你的名字：去掉开头的 "transformer."                        提示：str.removeprefix
-            #   ③ 名字以 transposed 中的任意一个结尾 -> 拷贝 hf_tensor.t()，否则直接拷贝 hf_tensor
-            #      提示：str.endswith 可以直接传一个元组；拷贝用 sd[key].copy_(...)
             if hf_key == "lm_head.weight":
                 continue
             key = hf_key.removeprefix("transformer.")
@@ -230,12 +215,28 @@ def from_pretrained(hf_name="openai-community/gpt2"):
 def generate(model, idx, max_new_tokens):
     """idx: (B, T) 的 token id  ->  返回 (B, T + max_new_tokens)"""
     for _ in range(max_new_tokens):
-        # TODO 四步：
-        #   ① logits = model(idx)                          (B, T, vocab_size)
-        #   ② 只取最后一个位置的打分                        (B, vocab_size)    提示：切片 [:, -1, :]
-        #   ③ 选出分数最高的词 next_id                      (B, 1)             提示：argmax(dim=-1, keepdim=True)
-        #   ④ 把 next_id 拼到 idx 后面，得到新的 idx        (B, T+1)           提示：torch.cat，想想沿哪一维
         logits = model(idx)
         next_id = logits[:, -1, :].argmax(dim = -1, keepdim = True)
         idx = torch.cat([idx,next_id], dim = -1)
+    return idx
+
+
+# ---------------------------------------------------------------------------
+# M1 第 4 步：带 KV Cache 的生成
+#   prefill：把整个 prompt 一次送进去，顺便把每层的 k、v 存进缓存
+#   decode ：之后每一步只送 1 个新 token，旧 token 的 k、v 直接从缓存里拿
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def generate_cached(model, idx, max_new_tokens):
+    """和 generate 的输入输出完全一样，只是内部用了 KV Cache"""
+    kv_cache = new_kv_cache(model.config)
+
+    # TODO ① prefill：logits = model(整个 idx, kv_cache=kv_cache)
+
+    for _ in range(max_new_tokens):
+        # TODO 和 generate 几乎一样，只有一处不同：
+        #   ② 从 logits 的最后一个位置选出 next_id                  (B, 1)
+        #   ③ 拼到 idx 后面（idx 仍然要保留完整序列，最后要返回）
+        #   ④ decode：只把 next_id 送进模型（不是整个 idx！），得到下一轮的 logits
+        pass
     return idx

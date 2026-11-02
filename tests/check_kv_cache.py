@@ -104,9 +104,37 @@ def check_model_cache():
     return 0.0
 
 
+def check_generate_cached():
+    cfg = M.GPTConfig(block_size=64, vocab_size=100, n_layer=3, n_head=4, n_embd=32)
+    # 用 float64，避免两种算法的微小浮点误差恰好让 argmax 选了不同的词
+    model = M.GPT2(cfg).double().eval()
+    idx = torch.randint(0, cfg.vocab_size, (2, 5))
+    n_new = 12
+
+    want = M.generate(model, idx, n_new)
+    try:
+        got = M.generate_cached(model, idx, n_new)
+    except IndexError:
+        raise AssertionError("位置编号超出了 block_size：decode 时是不是又把整个 idx 送进去了？"
+                             "缓存里已经有旧 token 了，每一步只需要送新 token") from None
+    assert isinstance(got, torch.Tensor), f"generate_cached 应该返回 Tensor，实际是 {type(got).__name__}"
+    if got.shape == idx.shape:
+        raise NotImplementedError
+    assert got.shape == want.shape, (
+        f"形状应为 {tuple(want.shape)}（原来 {idx.shape[1]} 个 + 新生成 {n_new} 个），实际是 {tuple(got.shape)}"
+    )
+    diff = (got != want).any(dim=0).nonzero()
+    assert len(diff) == 0, (
+        f"从第 {diff[0].item()} 个 token 开始和不带缓存的 generate 不一样。"
+        "decode 时送进模型的是不是只有新 token？每一步用的是不是同一份 kv_cache？"
+    )
+    return 0.0
+
+
 STEPS = [
     ("M1 第 2 步：带缓存的 attention", check_attention_cache),
     ("M1 第 3 步：带缓存的整个模型", check_model_cache),
+    ("M1 第 4 步：generate_cached 与 generate 逐 token 一致", check_generate_cached),
 ]
 
 
