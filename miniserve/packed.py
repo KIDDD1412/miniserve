@@ -96,4 +96,14 @@ def packed_forward(model, tokens, positions, seq_lens, kv_caches):
     #      "第 i 层的缓存们" = 每个请求的 kv_caches 里取第 i 层：[c[i] for c in kv_caches]
     #   ③ 只取每个请求最后一个 token 的 logits
     #        每个请求最后一个 token 在第几行？提示：seq_lens 累加起来再减 1
-    raise NotImplementedError
+    x = model.wte(tokens) + model.wpe(positions)
+    for i, block in enumerate(model.h):
+        layer_cache = [c[i] for c in kv_caches]
+        x = x + packed_attention(block.attn, block.ln_1(x), seq_lens, layer_cache)
+        x = x + block.mlp(block.ln_2(x))
+    last = torch.tensor(seq_lens, device = x.device).cumsum(0) - 1
+    x_last = x[last]
+    x_last = model.ln_f(x_last)
+    logits = model.lm_head(x_last)
+    return logits
+

@@ -154,7 +154,7 @@ class GPT2(nn.Module):
         # weight tying：让 lm_head 和 wte 用同一份权重（一行赋值）
         self.lm_head.weight = self.wte.weight
 
-    # TODO（M1 第 3 步）给整个模型加上缓存：
+    # （M1 第 3 步）给整个模型加上缓存：
     #   ① 签名改成 forward(self, idx, kv_cache=None)，kv_cache 是 new_kv_cache() 建的列表（每层一个）
     #   ② 位置编号要接着之前的往后数：
     #        past = 已经缓存了几个 token（没传缓存或缓存还是空的时候是 0）
