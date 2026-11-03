@@ -232,11 +232,13 @@ def generate_cached(model, idx, max_new_tokens):
     kv_cache = new_kv_cache(model.config)
 
     # TODO ① prefill：logits = model(整个 idx, kv_cache=kv_cache)
-
+    logits = model(idx, kv_cache = kv_cache)
     for _ in range(max_new_tokens):
         # TODO 和 generate 几乎一样，只有一处不同：
         #   ② 从 logits 的最后一个位置选出 next_id                  (B, 1)
         #   ③ 拼到 idx 后面（idx 仍然要保留完整序列，最后要返回）
         #   ④ decode：只把 next_id 送进模型（不是整个 idx！），得到下一轮的 logits
-        pass
+        next_id = logits[:, -1, :].argmax(dim = -1, keepdim = True)
+        idx = torch.cat([idx, next_id], dim = -1)
+        logits = model(next_id, kv_cache = kv_cache)
     return idx
