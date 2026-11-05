@@ -71,7 +71,14 @@ class Engine:
             #        已经送过：只送 req.output 的最后一个                          → decode
             #      ② 它们的位置编号：从 req.num_computed 开始往后数
             #      ③ 分别加进 tokens、positions（用 extend），再把个数加进 seq_lens
-            pass
+            start = req.num_computed
+            if start == 0:
+                t = req.prompt
+            else:
+                t = req.output[-1:]
+            tokens.extend(t)
+            positions.extend(list(range(start, start + len(t))))
+            seq_lens.append(len(t))
 
         tokens = torch.tensor(tokens, device=device)
         positions = torch.tensor(positions, device=device)
@@ -83,6 +90,9 @@ class Engine:
         #        把新 token 接到 req.output 后面；req.num_computed 加上这一轮送进去的个数
         #      提示：for req, nid, n in zip(self.running, next_ids, seq_lens)
 
+        for req, nid, n in zip(self.running, next_ids, seq_lens):
+            req.output.append(nid)
+            req.num_computed += n
     # -----------------------------------------------------------------------
     # 第 2b 步：调度 + 收尾
     # -----------------------------------------------------------------------
@@ -92,7 +102,13 @@ class Engine:
         #   "continuous"：只要 running 没满，就一直从 waiting 里补
         #   放进 running 的请求，要给它建好缓存：req.kv_cache = new_kv_cache(self.model.config)
         #   提示：self.waiting.popleft() 取出最早到达的请求
-        pass
+        if self.policy == "static" and self.running:
+            return
+        while self.waiting and len(self.running) < self.max_batch_size:
+            req = self.waiting.popleft()
+            req.kv_cache = new_kv_cache(self.model.config)
+            self.running.append(req)
+
 
     def step(self):
         """跑一轮；返回这一轮结束的请求列表"""
@@ -104,7 +120,9 @@ class Engine:
 
         # TODO 把已经生成够的请求（req.finished）从 running 里移走，并作为返回值
         #   提示：先挑出 finished 的，再让 self.running 只保留没结束的
-        return []
+        done = [req for req in self.running if req.finished]
+        self.running = [req for req in self.running if not req.finished]
+        return done
 
     def run_all(self):
         """一直跑到所有请求都结束；按 rid 返回每个请求生成的 token"""

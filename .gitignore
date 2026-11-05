@@ -7,3 +7,4 @@ __pycache__/
 *.pt
 *.bin
 *.safetensors
+CLAUDE.md
