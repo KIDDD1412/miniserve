@@ -20,7 +20,8 @@ Paged KV Cache 的做法：
     第 0~3 个 token 放在 7 号块，第 4~7 个放在 2 号块，第 8~9 个放在 5 号块（5 号块还剩 2 个空位）
 
 第 1 步：块分配器 —— 只管"哪些块空着、分给谁、收回来"，还不碰张量
-第 2 步：缓存池 —— 真正存 k、v 的大张量，以及"第几个 token 存在池子里哪个位置"的换算
+第 2 步：缓存池 —— 真正存 k、v 的大张量，以及"第几个 token 存在池子里哪个槽位"的换算
+第 3 步：用块表一次取出所有请求的 k、v，一次算完 decode attention（去掉 packed_attention 的 for 循环）
 检查："D:\\Program Files\\Anaconda\\envs\\miniserve\\python.exe" tests/check_paged.py
 """
 from collections import deque
@@ -91,15 +92,23 @@ class BlockAllocator:
 # 槽位按块排好：0 号块是槽位 0 ~ block_size-1，1 号块是槽位 block_size ~ 2*block_size-1，……
 #
 # 例子（block_size = 4，块表 = [7, 2, 5]）：
-#     第 5 个 token → 在请求的第 5 // 4 = 1 个块里，块内第 5 % 4 = 1 个位置
+#     第 5 个 token → 在请求的第 5 // 4 = 1 个块里，块内第 5 % 4 = 1 格
 #                   → 块表[1] = 2 号块 → 槽位 2 × 4 + 1 = 9
 # ---------------------------------------------------------------------------
 def slot_mapping(block_table: list[int], positions: list[int], block_size: int) -> list[int]:
     """
     第 2a 步：一个请求里第 positions[i] 个 token，存在池子里的几号槽位
     block_table: 这个请求的块表，比如 [7, 2, 5]
-    positions:   要换算的 token 位置（Python 列表），比如 [4, 5, 6]
-    返回：        对应的槽位号（Python 列表），和 positions 一一对应
+    positions:   要换算的 token 位置（Python 列表）。
+                 位置 = 这个 token 是请求里的第几个，每个请求都从 0 开始数，和别的请求、和池子都无关。
+                 可以只换算其中一部分，所以不一定从 0 开始：
+                     读这个请求的全部历史（第 3a 步）：list(range(L))，即 [0, 1, ..., L-1]
+                     只写新 token：已经有 4 个 token、又来了 3 个 → [4, 5, 6]
+    返回：        对应的槽位号（Python 列表），和 positions 一一对应。
+                 槽位号 = 在池子里的第几格，所有请求共用一个池子，所以不从 0 开始、也不连续。
+    例子（block_size = 4）：
+        slot_mapping([7, 2, 5], [0, 1, 2, 3, 4], 4) → [28, 29, 30, 31, 8]
+        slot_mapping([7, 2, 5], [4, 5, 6], 4)       → [8, 9, 10]
     """
     # TODO 对每个位置 pos：先算它在请求的第几个块、块内第几个，再查块表得到真正的块号，最后换算成槽位号
     #   提示：用列表推导式，一行就能写完
@@ -149,3 +158,56 @@ class KVCachePool:
     def read(self, layer: int, slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """取出第 layer 层、这些槽位上的 k、v，返回两个 (len(slots), C) 的张量"""
         return self.k[layer, slots], self.v[layer, slots]
+
+
+# ---------------------------------------------------------------------------
+# M3 第 3 步：用块表一次算出所有请求的 decode attention（去掉 packed_attention 的 for 循环）
+#
+# decode 时每个请求只送 1 个新 token，但它要看自己的全部历史 k、v，而每个请求的历史长度不一样。
+# 做法：
+#     把每个请求的历史槽位排成一行，短的在后面补齐到同样长度 Lmax，拼成一张 (B, Lmax) 的【槽位表】，
+#     再配一张同样形状的 valid 表，标出哪些格子是真 token（True）、哪些是补齐出来的（False）。
+#     之后用槽位表一次从池子里取出所有请求的 k、v → (B, Lmax, C)，
+#     softmax 之前把补齐的格子填成 -inf，结果就和每个请求单独算完全一样。
+#
+# 例子（block_size = 4）：
+#     请求 0：块表 [7, 2, 5]，一共 10 个 token → 槽位 28 29 30 31 8 9 10 11 20 21
+#     请求 1：块表 [1]，     一共 1 个 token  → 槽位 4
+#     请求 2：块表 [3, 4]，  一共 5 个 token  → 槽位 12 13 14 15 16
+#
+#     slot_table（Lmax = 10，补齐的格子填 0）          valid
+#       [[28, 29, 30, 31,  8,  9, 10, 11, 20, 21],     [[T, T, T, T, T, T, T, T, T, T],
+#        [ 4,  0,  0,  0,  0,  0,  0,  0,  0,  0],      [T, F, F, F, F, F, F, F, F, F],
+#        [12, 13, 14, 15, 16,  0,  0,  0,  0,  0]]      [T, T, T, T, T, F, F, F, F, F]]
+#
+# 补齐的格子为什么填 0？—— 0 号槽位一定存在，按它去池子里取不会越界；
+#     取出来的是不相干的数据，但会被 valid 盖掉，不影响结果
+# ---------------------------------------------------------------------------
+def build_slot_table(block_tables: list[list[int]], seq_lens: list[int], block_size: int,
+                     device: str | torch.device = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    第 3a 步：把所有请求的槽位排成一张补齐的表
+    block_tables: 每个请求的块表，比如 [[7, 2, 5], [1], [3, 4]]
+    seq_lens:     每个请求现在一共有几个 token（decode 时包括这一轮刚写进池子的新 token），比如 [10, 1, 5]
+    返回 (slot_table, valid)，形状都是 (B, Lmax)，B = 请求数，Lmax = max(seq_lens)
+        slot_table: 整数张量，第 b 行的前 seq_lens[b] 个数是请求 b 第 0 ~ seq_lens[b]-1 个 token 的槽位号，后面补 0
+        valid:      布尔张量，真 token 的格子是 True，补齐的格子是 False
+    """
+    # TODO ① 算出 Lmax
+    #      ② 准备两个空列表 slot_rows、valid_rows，然后对每个请求（for table, L in zip(block_tables, seq_lens)）：
+    #           槽位那一行：用你写的 slot_mapping 算出第 0 ~ L-1 个 token 的槽位（长度 L 的列表），后面补 Lmax - L 个 0
+    #           valid 那一行：L 个 True，后面 Lmax - L 个 False
+    #      ③ 用 torch.tensor(..., device=device) 把两个"列表的列表"分别变成 (B, Lmax) 的张量，返回这两个张量
+    Lmax = max(seq_lens)
+    slot_rows = []
+    valid_rows = []
+    for table, L in zip(block_tables, seq_lens):
+        slot_row = slot_mapping(table, list(range(L)), block_size) + [0] * (Lmax - L)
+        valid_row = [True] * L + [False] * (Lmax - L)
+        slot_rows.append(slot_row)
+        valid_rows.append(valid_row)
+    return torch.tensor(slot_rows, device=device), torch.tensor(valid_rows, device=device)
+
+
+
+

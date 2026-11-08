@@ -225,12 +225,131 @@ def check_pool():
     assert torch.count_nonzero(pool.k[:, unused]) == 0, "没用到的槽位也被写了：write 只能写 slots 指定的那几个槽位、第 layer 层"
 
 
+def call_build_slot_table(*args, **kwargs):
+    """调用 build_slot_table；每行没补齐时 torch.tensor 会报 ValueError，单独给提示"""
+    try:
+        return P.build_slot_table(*args, **kwargs)
+    except NotImplementedError:
+        raise
+    except ValueError as e:
+        if "expected sequence of length" in str(e):
+            traceback.print_exc()
+            raise AssertionError(
+                "torch.tensor 报错说各行长度不一样：每一行都要补齐到 Lmax 个元素，才能拼成 (B, Lmax) 的矩阵（完整报错见上面）"
+            ) from None
+        traceback.print_exc()
+        raise UserCodeError("build_slot_table 运行时报错了（完整报错见上面）") from None
+    except Exception:
+        traceback.print_exc()
+        raise UserCodeError("build_slot_table 运行时报错了（完整报错见上面）") from None
+
+
+def ref_slot_table(tables, lens, bs):
+    import torch
+    Lmax = max(lens)
+    slots = [[ref_slot(t, p, bs) for p in range(L)] + [0] * (Lmax - L) for t, L in zip(tables, lens)]
+    valid = [[True] * L + [False] * (Lmax - L) for L in lens]
+    return torch.tensor(slots), torch.tensor(valid)
+
+
+def check_one_slot_table(tables, lens, bs):
+    import torch
+
+    want_slots, want_valid = ref_slot_table(tables, lens, bs)
+    B, Lmax = len(lens), max(lens)
+    case = f"块表 {tables}、seq_lens {lens}、block_size={bs}"
+
+    got = call_build_slot_table(tables, lens, bs)
+    assert got is not None, "build_slot_table 没有返回值：要 return slot_table, valid"
+    assert isinstance(got, tuple) and len(got) == 2, (
+        f"build_slot_table 应该返回两个东西（return slot_table, valid），实际返回的是 {type(got).__name__}"
+    )
+    slots, valid = got
+    for name, t in [("slot_table", slots), ("valid", valid)]:
+        assert isinstance(t, torch.Tensor), (
+            f"{name} 应该是张量，实际是 {type(t).__name__}：最后要用 torch.tensor(...) 把列表的列表变成张量"
+        )
+        assert t.dim() == 2, f"{name} 应该是二维的 (B, Lmax)，实际形状是 {tuple(t.shape)}"
+        if t.shape[1] != Lmax and t.shape[0] == B:
+            raise AssertionError(
+                f"{case}：{name} 的形状应该是 ({B}, {Lmax})，实际是 {tuple(t.shape)}。"
+                f"每一行要正好 Lmax = max(seq_lens) = {Lmax} 个元素：前 L 个是真 token，后面补 Lmax - L 个"
+                "（range(L) 是 0 ~ L-1，正好 L 个）"
+            )
+        assert tuple(t.shape) == (B, Lmax), f"{case}：{name} 的形状应该是 ({B}, {Lmax})，实际是 {tuple(t.shape)}"
+
+    assert not slots.is_floating_point(), (
+        f"slot_table 的类型是 {slots.dtype}，应该是整数：槽位号要拿来当下标用，浮点数不能当下标"
+    )
+    assert valid.dtype == torch.bool, (
+        f"valid 的类型是 {valid.dtype}，应该是 torch.bool：valid 那一行要用 True / False 来建，不要用 1 / 0"
+    )
+
+    if not torch.equal(valid, want_valid):
+        if torch.equal(valid, ~want_valid):
+            raise AssertionError("valid 正好反了：真 token 的格子是 True，补齐的格子才是 False")
+        if torch.equal(valid, slots != 0):
+            raise AssertionError(
+                "valid 看起来是用 slot_table != 0 算的：0 号槽位也可能放着真 token（块表里有 0 号块时），"
+                "要按每个请求的长度 L 来建：L 个 True + (Lmax - L) 个 False"
+            )
+        for b in range(B):
+            if not torch.equal(valid[b], want_valid[b]):
+                raise AssertionError(
+                    f"{case}：第 {b} 个请求有 {lens[b]} 个 token，valid 第 {b} 行应该是 {want_valid[b].tolist()}，"
+                    f"实际是 {valid[b].tolist()}"
+                )
+
+    for b in range(B):
+        L = lens[b]
+        g, w = slots[b, :L].tolist(), want_slots[b, :L].tolist()
+        if g != w:
+            hint = ""
+            if g == list(range(L)):
+                hint = "：槽位号就是位置本身，没查块表 —— 要用 slot_mapping(table, 第 0 ~ L-1 个位置, block_size)"
+            raise AssertionError(
+                f"{case}：第 {b} 个请求的前 {L} 个槽位应该是 {w}，实际是 {g}{hint}"
+            )
+    pad = slots[~want_valid]
+    assert torch.count_nonzero(pad) == 0, (
+        f"{case}：补齐的格子要填 0，现在 slot_table = {slots.tolist()}"
+    )
+
+
+def check_slot_table():
+    import torch
+
+    # 0 号块也在用：请求 1 的第 0 个 token 就在 0 号槽位
+    check_one_slot_table([[7, 2, 5], [0], [3, 4]], [10, 1, 5], 4)
+    # 长度都一样：不用补齐
+    check_one_slot_table([[2], [0]], [3, 3], 4)
+    # 只有一个请求、正好装满两个块
+    check_one_slot_table([[3, 1]], [8], 4)
+    # 补齐的长度超过一个块
+    check_one_slot_table([[5, 6, 7, 8], [9]], [13, 2], 4)
+
+    # 有没有把张量放到传进来的 device 上（"meta" 是 PyTorch 自带的假设备，不需要显卡）
+    try:
+        slots, valid = call_build_slot_table([[7, 2, 5], [1]], [10, 1], 4, "meta")
+    except NotImplementedError:          # 前面几项都过了，说明已经写完；这里是 meta 设备不支持某个操作
+        traceback.print_exc()
+        raise UserCodeError(
+            "build_slot_table 在 device='meta' 上运行时报错了（完整报错见上面）：要先用 Python 列表准备好数据，"
+            "最后一步再 torch.tensor(..., device=device)"
+        ) from None
+    assert slots.device.type == "meta" and valid.device.type == "meta", (
+        f"传了 device='meta'，但返回的张量在 {slots.device} / {valid.device} 上：要写 torch.tensor(..., device=device)，"
+        "否则以后在 GPU 上跑时，槽位表会留在 CPU 上"
+    )
+
+
 STEPS = [
     ("M3 第 1a 步：blocks_needed", check_blocks_needed),
     ("M3 第 1b 步：BlockAllocator", check_allocator),
     ("M3 第 2a 步：slot_mapping", check_slot_mapping),
     ("M3 第 2b 步：ensure_blocks", check_ensure_blocks),
     ("M3 第 2c 步：KVCachePool.write", check_pool),
+    ("M3 第 3a 步：build_slot_table", check_slot_table),
 ]
 
 
