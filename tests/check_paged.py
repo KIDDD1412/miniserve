@@ -343,6 +343,121 @@ def check_slot_table():
     )
 
 
+def ref_decode_attention(q, k, v, lens, nh, scale=True):
+    """逐个请求单独算（只用前 L 个真 token），当作标准答案"""
+    import math
+    import torch
+    B, Lmax, C = k.shape
+    hs = C // nh
+    outs = []
+    for b in range(B):
+        L = lens[b]
+        qb = q[b].view(nh, 1, hs)                           # (nh, 1, hs)
+        kb = k[b, :L].view(L, nh, hs).transpose(0, 1)       # (nh, L, hs)
+        vb = v[b, :L].view(L, nh, hs).transpose(0, 1)
+        s = qb @ kb.transpose(-2, -1)
+        if scale:
+            s = s / math.sqrt(hs)
+        outs.append((s.softmax(-1) @ vb).transpose(0, 1).reshape(C))
+    return torch.stack(outs)
+
+
+def make_decode_inputs(lens, nh, C, g):
+    """随机的 q、k、v；补齐的格子里故意放很大的数：没盖住的话结果会差很多"""
+    import torch
+    B, Lmax = len(lens), max(lens)
+    q = torch.randn(B, C, generator=g, dtype=torch.float64)
+    k = torch.randn(B, Lmax, C, generator=g, dtype=torch.float64)
+    v = torch.randn(B, Lmax, C, generator=g, dtype=torch.float64)
+    valid = torch.tensor([[True] * L + [False] * (Lmax - L) for L in lens])
+    for b, L in enumerate(lens):
+        k[b, L:] = 10 * q[b]          # 和 q 的点积很大：没盖住的话 softmax 几乎全给它
+        v[b, L:] = 100.0
+    return q, k, v, valid
+
+
+def call_decode_attention(*args):
+    import torch  # noqa: F401
+    try:
+        return P.paged_decode_attention(*args)
+    except NotImplementedError:
+        raise
+    except RuntimeError as e:
+        traceback.print_exc()
+        msg = str(e)
+        if "broadcast" in msg or "must match the size" in msg or "expand" in msg:
+            raise AssertionError(
+                "形状对不上（完整报错见上面）：scores 是 (B, nh, 1, Lmax)，valid 是 (B, Lmax)，"
+                "要先变成 (B, 1, 1, Lmax) 才能和 scores 对齐 —— valid[:, None, None, :]"
+            ) from None
+        raise UserCodeError("paged_decode_attention 运行时报错了（完整报错见上面）") from None
+    except Exception:
+        traceback.print_exc()
+        raise UserCodeError("paged_decode_attention 运行时报错了（完整报错见上面）") from None
+
+
+def check_one_decode(lens, nh, C, g):
+    import torch
+
+    q, k, v, valid = make_decode_inputs(lens, nh, C, g)
+    B, Lmax = len(lens), max(lens)
+    case = f"seq_lens {lens}、n_head={nh}、C={C}"
+    backup = [t.clone() for t in (q, k, v, valid)]
+
+    got = call_decode_attention(q, k, v, valid, nh)
+    assert got is not None, "paged_decode_attention 没有返回值：是不是忘了 return？"
+    assert isinstance(got, torch.Tensor), f"应该返回张量，实际返回的是 {type(got).__name__}"
+    for name, before, after in zip(("q", "k", "v", "valid"), backup, (q, k, v, valid)):
+        assert torch.equal(before, after), (
+            f"传进来的 {name} 被改掉了：不要原地修改输入（比如对 {name} 用带下划线的 masked_fill_ / logical_not_），"
+            "只能原地改你自己算出来的 scores"
+        )
+    if got.shape != (B, C):
+        hint = ""
+        if got.numel() == B * C:
+            hint = "：元素个数对，形状不对 —— 最后要 .view(B, C)"
+        raise AssertionError(f"{case}：返回的形状应该是 ({B}, {C})，实际是 {tuple(got.shape)}{hint}")
+    assert got.dtype == q.dtype, f"输入是 {q.dtype}，返回的却是 {got.dtype}：中间不要换数据类型"
+
+    want = ref_decode_attention(q, k, v, lens, nh)
+    if torch.allclose(got, want, atol=1e-10):
+        return
+
+    full = torch.tensor([L == Lmax for L in lens])
+    nan_rows = torch.isnan(got).any(dim=-1)
+    if nan_rows[full].any():
+        raise AssertionError(
+            f"{case}：没有补齐的请求（每个格子都是真 token）算出了 NaN —— 说明把真 token 盖住了。"
+            "要填 -inf 的是【不是】真 token 的格子：用 ~valid，不是 valid"
+        )
+    if nan_rows.any():
+        raise AssertionError(
+            f"{case}：有补齐的请求算出了 NaN。检查 softmax 是不是沿最后一维（dim=-1，也就是 Lmax 那一维）"
+        )
+    if torch.allclose(got, ref_decode_attention(q, k, v, [Lmax] * B, nh), atol=1e-10):
+        raise AssertionError(
+            f"{case}：结果和【不盖补齐格子】时一模一样 —— 补齐的格子没有填 -inf，"
+            "masked_fill 的结果有没有接住？（不带下划线的 masked_fill 返回新张量，要写 scores = scores.masked_fill(...)）"
+        )
+    if torch.allclose(got, ref_decode_attention(q, k, v, lens, nh, scale=False), atol=1e-10):
+        raise AssertionError(f"{case}：结果和不除以 sqrt(hs) 时一样 —— scores 忘了除以 math.sqrt(hs)")
+    bad = [b for b in range(B) if not torch.allclose(got[b], want[b], atol=1e-10)]
+    raise AssertionError(
+        f"{case}：第 {bad} 个请求的结果和逐个请求单独算的不一样（最大误差 {(got - want).abs().max().item():.3g}）。"
+        "检查拆头：q 是 view(B, 1, nh, hs).transpose(1, 2)，k、v 是 view(B, Lmax, nh, hs).transpose(1, 2)"
+    )
+
+
+def check_decode_attention():
+    import torch
+
+    g = torch.Generator().manual_seed(0)
+    check_one_decode([10, 1, 5], 2, 8, g)          # 有长有短，有的只有 1 个 token
+    check_one_decode([4, 4], 4, 8, g)              # 一样长，不用补齐；4 个头
+    check_one_decode([1], 2, 8, g)                 # 只有一个请求、只有 1 个 token
+    check_one_decode([3, 7, 2, 7], 2, 12, g)       # hs = 6
+
+
 STEPS = [
     ("M3 第 1a 步：blocks_needed", check_blocks_needed),
     ("M3 第 1b 步：BlockAllocator", check_allocator),
@@ -350,6 +465,7 @@ STEPS = [
     ("M3 第 2b 步：ensure_blocks", check_ensure_blocks),
     ("M3 第 2c 步：KVCachePool.write", check_pool),
     ("M3 第 3a 步：build_slot_table", check_slot_table),
+    ("M3 第 3b 步：paged_decode_attention", check_decode_attention),
 ]
 
 

@@ -24,6 +24,7 @@ Paged KV Cache 的做法：
 第 3 步：用块表一次取出所有请求的 k、v，一次算完 decode attention（去掉 packed_attention 的 for 循环）
 检查："D:\\Program Files\\Anaconda\\envs\\miniserve\\python.exe" tests/check_paged.py
 """
+import math
 from collections import deque
 
 import torch
@@ -210,4 +211,51 @@ def build_slot_table(block_tables: list[list[int]], seq_lens: list[int], block_s
 
 
 
+
+
+
+# ---------------------------------------------------------------------------
+# M3 第 3b 步：一次算出所有请求的 decode attention
+#
+# 调用之前（第 3c 步会做）：
+#     ① 每个请求这一轮新 token 的 k、v 已经写进池子
+#     ② 用第 3a 步的 slot_table 一次从池子里取出所有请求的全部历史：k, v = pool.read(layer, slot_table)
+#        slot_table 是 (B, Lmax)，取出来就是 (B, Lmax, C)（下标张量是什么形状，结果前面几维就是什么形状）
+#
+# 这一步只管数学：q 是每个请求 1 个新 token，k、v 是每个请求补齐后的全部历史
+#
+# 为什么这里不需要 M1 那种下三角（因果）mask？
+#     decode 时每个请求只有 1 个 q，就是最新的那个 token，它本来就能看见自己之前的所有 token（包括它自己）。
+#     要盖住的只有【补齐出来的格子】，所以用 valid 就够了。
+# ---------------------------------------------------------------------------
+def paged_decode_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                           valid: torch.Tensor, n_head: int) -> torch.Tensor:
+    """
+    第 3b 步：所有请求的 decode attention 一起算，没有 for 循环
+    q:      (B, C)        每个请求这一轮新 token 的 q
+    k, v:   (B, Lmax, C)  每个请求的全部历史 k、v（包括新 token 自己），短的请求后面是补齐的格子，里面是不相干的数据
+    valid:  (B, Lmax)     布尔张量，第 3a 步返回的那个：真 token 是 True，补齐的格子是 False
+    n_head: 头数
+    返回：   (B, C)        每个请求新 token 的 attention 输出（还没过 c_proj）
+    """
+    # TODO ① 从 k 的形状拿到 B、Lmax、C，算出每个头的维度 hs
+    #      ② 拆头，变成你熟悉的形状：
+    #           q → (B, nh, 1, hs)       提示：先 view(B, 1, nh, hs) 再 transpose(1, 2)，和 M1 一样，只是 T = 1
+    #           k、v → (B, nh, Lmax, hs)  提示：先 view(B, Lmax, nh, hs) 再 transpose(1, 2)
+    #      ③ scores = q 乘 k 的转置，除以 sqrt(hs)                      → (B, nh, 1, Lmax)
+    #      ④ 把补齐的格子填成 -inf：
+    #           valid 是 (B, Lmax)，要先变成 (B, 1, 1, Lmax) 才能和 scores 对上    提示：valid[:, None, None, :]
+    #           要盖住的是"不是真 token"的格子                                  提示：布尔张量取反用 ~
+    #      ⑤ softmax（沿最后一维）、乘 v                                     → (B, nh, 1, hs)
+    #      ⑥ 合并头变回 (B, C)                         提示：transpose(1, 2).contiguous().view(B, C)
+    B, Lmax, C = k.shape
+    hs = C // n_head
+    nh = n_head
+    q = q.view(B, 1, nh, hs).transpose(1,2)
+    k = k.view(B, Lmax, nh, hs).transpose(1,2)
+    v = v.view(B, Lmax, nh, hs).transpose(1,2)
+    scores = q @ k.transpose(-2, -1) / math.sqrt(hs)
+    scores.masked_fill_(~valid[:, None, None, :], float("-inf"))
+    attn = scores.softmax(dim=-1)
+    return (attn @ v).transpose(1, 2).contiguous().view(B, C)
 
