@@ -458,6 +458,238 @@ def check_decode_attention():
     check_one_decode([3, 7, 2, 7], 2, 12, g)       # hs = 6
 
 
+def call_decode_layer(*args):
+    try:
+        return P.paged_decode_layer(*args)
+    except NotImplementedError:
+        raise
+    except ValueError as e:
+        traceback.print_exc()
+        if "not enough values to unpack" in str(e):
+            raise AssertionError(
+                "paged_decode_attention 里 B, Lmax, C = k.shape 拆不开（完整报错见上面）：传给它的 k、v 应该是 (B, Lmax, C) 的全部历史，"
+                "也就是 ③ pool.read 读出来的 k_all、v_all，不是 ① 新 token 的 k、v"
+            ) from None
+        raise UserCodeError("paged_decode_layer 运行时报错了（完整报错见上面）") from None
+    except Exception:
+        traceback.print_exc()
+        raise UserCodeError("paged_decode_layer 运行时报错了（完整报错见上面）") from None
+
+
+def check_decode_layer():
+    """和 M2 的 packed_attention（已经和 HF 对齐过）比：同样的历史、同样的新 token，结果要一样"""
+    import torch
+    from miniserve.model import GPT2, GPTConfig, LayerKVCache
+    from miniserve.packed import packed_attention
+
+    torch.manual_seed(0)
+    cfg = GPTConfig(block_size=64, vocab_size=50, n_layer=2, n_head=2, n_embd=8)
+    model = GPT2(cfg).double().eval()
+    layer = 1                                  # 故意用第 1 层：检查有没有写到 / 读自第 layer 层
+    attn = model.h[layer].attn
+    C, bs = cfg.n_embd, 4
+    pool = P.KVCachePool(cfg, num_blocks=12, block_size=bs, dtype=torch.float64)
+    pool.allocator.allocate()                  # 占掉 0 号块：补齐的格子读 0 号槽位，读到的是全 0
+
+    hist_lens = [9, 0, 4]                      # 每个请求之前已经有几个 token（第 1 个请求是刚 prefill 完的空历史）
+    B = len(hist_lens)
+    tables, caches = [], []
+    for L in hist_lens:
+        table = []
+        P.ensure_blocks(table, L + 1, bs, pool.allocator)     # 连新 token 的位置一起分好块
+        k_hist = torch.randn(L, C, dtype=torch.float64)
+        v_hist = torch.randn(L, C, dtype=torch.float64)
+        cache = LayerKVCache()
+        if L > 0:
+            pool.write(layer, torch.tensor(P.slot_mapping(table, list(range(L)), bs)), k_hist, v_hist)
+            cache.k = k_hist.view(1, L, cfg.n_head, C // cfg.n_head).transpose(1, 2)
+            cache.v = v_hist.view(1, L, cfg.n_head, C // cfg.n_head).transpose(1, 2)
+        tables.append(table)
+        caches.append(cache)
+
+    new_slots = torch.tensor([P.slot_mapping(t, [L], bs)[0] for t, L in zip(tables, hist_lens)])
+    slot_table, valid = P.build_slot_table(tables, [L + 1 for L in hist_lens], bs)
+    x = torch.randn(B, C, dtype=torch.float64)
+
+    with torch.no_grad():
+        want = packed_attention(attn, x, [1] * B, caches)
+        q_new, k_new, v_new = attn.c_attn(x).split(C, dim=-1)
+        # "先读后写"会得到的结果：新 token 的槽位还是 0
+        k_old, v_old = pool.k[layer, slot_table].clone(), pool.v[layer, slot_table].clone()
+        read_first = attn.c_proj(P.paged_decode_attention(q_new, k_old, v_old, valid, cfg.n_head))
+        layer0_before = pool.k[0].clone()
+        got = call_decode_layer(attn, x, layer, pool, new_slots, slot_table, valid)
+
+    assert got is not None, "paged_decode_layer 没有返回值：是不是忘了 return？"
+    assert isinstance(got, torch.Tensor), f"应该返回张量，实际返回的是 {type(got).__name__}"
+    assert tuple(got.shape) == (B, C), f"返回的形状应该是 ({B}, {C})，实际是 {tuple(got.shape)}"
+
+    # 新 token 的 k、v 有没有写进池子
+    if not torch.equal(pool.k[0], layer0_before):
+        raise AssertionError("第 0 层的池子被改了：新 token 的 k、v 要写进第 layer 层（pool.write(layer, ...)）")
+    got_k, got_v = pool.k[layer, new_slots], pool.v[layer, new_slots]
+    if torch.count_nonzero(got_k) == 0:
+        raise AssertionError("新 token 的 k 没有写进池子：要用 pool.write(layer, new_slots, k, v)")
+    if torch.allclose(got_k, v_new) and torch.allclose(got_v, k_new):
+        raise AssertionError("写进池子的 k、v 反了：pool.write(layer, new_slots, k, v)，k 在前")
+    if torch.allclose(got_k, x):
+        raise AssertionError("写进池子的是 x 本身：要先过 attn.c_attn(x) 再 split 出 k、v，写的是 k、v")
+    assert torch.allclose(got_k, k_new) and torch.allclose(got_v, v_new), (
+        "写进池子的 k、v 不对：应该是 attn.c_attn(x).split(C, dim=-1) 拆出来的第 2、3 份"
+    )
+
+    if torch.allclose(got, want, atol=1e-10):
+        return
+    if torch.allclose(got, read_first, atol=1e-10):
+        raise AssertionError(
+            "结果和【先读后写】时一样：读出来的历史里没有新 token 自己。要先 pool.write，再 pool.read"
+        )
+    if torch.allclose(attn.c_proj(got), want, atol=1e-10):
+        raise AssertionError("差一步输出投影：最后要 return attn.c_proj(...)")
+    bad = [b for b in range(B) if not torch.allclose(got[b], want[b], atol=1e-10)]
+    raise AssertionError(
+        f"第 {bad} 个请求的结果和 packed_attention 不一样（最大误差 {(got - want).abs().max().item():.3g}）。"
+        "检查：pool.read 读的是第 layer 层、用的是 slot_table；paged_decode_attention 传的是 ① 的 q 和 ③ 读出来的 k_all、v_all"
+    )
+
+
+def call_decode_forward(*args):
+    try:
+        return P.paged_decode_forward(*args)
+    except NotImplementedError:
+        raise
+    except IndexError as e:
+        traceback.print_exc()
+        if "list index out of range" in str(e):
+            raise AssertionError(
+                "列表下标越界（完整报错见上面），很可能是块表不够长：新 token 在第 pos 个位置，"
+                "写它之前要先让块表够装下 pos + 1 个 token（第 2b 步的 ensure_blocks）"
+            ) from None
+        raise UserCodeError("paged_decode_forward 运行时报错了（完整报错见上面）") from None
+    except RuntimeError as e:
+        traceback.print_exc()
+        if "same device" in str(e):
+            raise AssertionError(
+                "有张量和模型不在同一个设备上（完整报错见上面）：你新建的张量（位置、槽位……）要放到 tokens.device 上"
+            ) from None
+        raise UserCodeError("paged_decode_forward 运行时报错了（完整报错见上面）") from None
+    except Exception:
+        traceback.print_exc()
+        raise UserCodeError("paged_decode_forward 运行时报错了（完整报错见上面）") from None
+
+
+def run_decode_forward(device):
+    """先用 M2 的 packed_forward 做 prefill、把缓存搬进池子，再两边一起 decode 6 轮，每轮对比 logits"""
+    import torch
+    from miniserve.model import GPT2, GPTConfig, new_kv_cache
+    from miniserve.packed import packed_forward
+
+    torch.manual_seed(0)
+    cfg = GPTConfig(block_size=64, vocab_size=50, n_layer=2, n_head=2, n_embd=8)
+    model = GPT2(cfg).double().eval().to(device)
+    C, bs = cfg.n_embd, 4
+    pool = P.KVCachePool(cfg, num_blocks=16, block_size=bs, device=device, dtype=torch.float64)
+    pool.allocator.allocate()                  # 占掉 0 号块
+
+    prompt_lens = [5, 1, 8]                    # 8 个 token 正好装满 2 块：第一轮 decode 就要补新块
+    B = len(prompt_lens)
+    g = torch.Generator().manual_seed(1)
+    prompts = [torch.randint(0, cfg.vocab_size, (L,), generator=g) for L in prompt_lens]
+
+    kv_caches = [new_kv_cache(cfg) for _ in range(B)]
+    with torch.no_grad():
+        logits = packed_forward(model, torch.cat(prompts).to(device),
+                                torch.cat([torch.arange(L) for L in prompt_lens]).to(device), prompt_lens, kv_caches)
+
+    def cache_kv(b, i):                        # packed 路径里请求 b 第 i 层的缓存，变回 (L, C)
+        c = kv_caches[b][i]
+        L = c.k.size(2)
+        return c.k[0].transpose(0, 1).reshape(L, C), c.v[0].transpose(0, 1).reshape(L, C)
+
+    tables = []
+    for b, L in enumerate(prompt_lens):
+        table = []
+        P.ensure_blocks(table, L, bs, pool.allocator)
+        slots = torch.tensor(P.slot_mapping(table, list(range(L)), bs), device=device)
+        for i in range(cfg.n_layer):
+            pool.write(i, slots, *cache_kv(b, i))
+        tables.append(table)
+
+    lens = list(prompt_lens)
+    for step in range(6):
+        where = f"（{device} 上第 {step + 1} 轮 decode，新 token 的位置 {lens}）"
+        next_tokens = logits.argmax(dim=-1)
+        positions = list(lens)
+        with torch.no_grad():
+            want = packed_forward(model, next_tokens, torch.tensor(positions, device=device), [1] * B, kv_caches)
+            before = [list(t) for t in tables]
+            got = call_decode_forward(model, next_tokens, positions, tables, pool)
+
+        assert got is not None, "paged_decode_forward 没有返回值：是不是忘了 return？"
+        assert isinstance(got, torch.Tensor), f"应该返回张量，实际返回的是 {type(got).__name__}"
+        assert tuple(got.shape) == (B, cfg.vocab_size), (
+            f"返回的形状应该是 ({B}, {cfg.vocab_size})，实际是 {tuple(got.shape)}{where}"
+        )
+
+        # 块表：原来的块不能变，够装新 token，新块来自分配器
+        for b in range(B):
+            assert tables[b][:len(before[b])] == before[b], f"请求 {b} 原来的块被改了：调用前 {before[b]}，调用后 {tables[b]}"
+            need = P.blocks_needed(positions[b] + 1, bs)
+            assert len(tables[b]) >= need, (
+                f"请求 {b} 的新 token 在位置 {positions[b]}，块表要至少 {need} 块，实际 {tables[b]}{where}：要先 ensure_blocks"
+            )
+        assert all(blk in pool.allocator.used for t in tables for blk in t), (
+            "块表里有不是分配器分出来的块号：补块要用 ensure_blocks（它会调用 pool.allocator.allocate()）"
+        )
+
+        # 池子：逐层对比 packed 路径的缓存，找出第一个出错的地方
+        for i in range(cfg.n_layer):
+            for b in range(B):
+                pos = positions[b]
+                want_k, want_v = cache_kv(b, i)
+                hist = torch.tensor(P.slot_mapping(tables[b], list(range(pos)), bs), device=device, dtype=torch.long)
+                new_slot = torch.tensor(P.slot_mapping(tables[b], [pos], bs), device=device)
+                hk, hv = pool.read(i, hist)
+                if not (torch.allclose(hk, want_k[:pos], atol=1e-10) and torch.allclose(hv, want_v[:pos], atol=1e-10)):
+                    raise AssertionError(
+                        f"请求 {b} 第 {i} 层：之前的旧 token 的 k、v 被改掉了{where}。"
+                        "新 token 写错了槽位，覆盖了旧 token —— 要写进【第 pos 个位置】对应的槽位"
+                    )
+                nk, nv = pool.read(i, new_slot)
+                if torch.count_nonzero(nk) == 0:
+                    raise AssertionError(
+                        f"请求 {b} 第 {i} 层：第 pos 个位置的槽位上没有东西{where}。新 token 的 k、v 没写到这里：检查 new_slots 是不是用第 pos 个位置算的"
+                    )
+                if torch.allclose(nk, want_k[pos:], atol=1e-10) and torch.allclose(nv, want_v[pos:], atol=1e-10):
+                    continue
+                if i == 0:
+                    raise AssertionError(
+                        f"请求 {b}：第 0 层新 token 的 k、v 就不对{where} —— 说明进第 0 层之前的 x 就错了。"
+                        "检查 x = 词嵌入 + 位置嵌入，位置嵌入要用传进来的 positions（新 token 在各自请求里的位置）"
+                    )
+                raise AssertionError(
+                    f"请求 {b}：{'第 0 层' if i == 1 else f'第 0 ~ {i - 1} 层'}都对，第 {i} 层新 token 的 k、v 不对{where} —— 问题出在层与层之间。检查："
+                    "① 每个请求的长度要算上新 token（pos + 1），不然新 token 看不到自己"
+                    "② 每层有两个残差：x = x + attention(...)，x = x + mlp(ln_2(x))"
+                )
+
+        if not torch.allclose(got, want, atol=1e-8):
+            bad = [b for b in range(B) if not torch.allclose(got[b], want[b], atol=1e-8)]
+            raise AssertionError(
+                f"第 {bad} 个请求的 logits 和 packed_forward 不一样{where}，最大误差 {(got - want).abs().max().item():.3g}。"
+                "每一层池子里的 k、v 都已经确认是对的，问题在最后一层的 attention 之后：检查最后一层的 MLP 残差，以及最后的 model.ln_f 和 model.lm_head"
+            )
+        lens = [L + 1 for L in lens]
+        logits = want
+
+
+def check_decode_forward():
+    import torch
+    run_decode_forward("cpu")
+    if torch.cuda.is_available():
+        run_decode_forward("cuda")             # 在 GPU 上再跑一遍：检查新建的张量有没有放对设备
+
+
 STEPS = [
     ("M3 第 1a 步：blocks_needed", check_blocks_needed),
     ("M3 第 1b 步：BlockAllocator", check_allocator),
@@ -466,6 +698,8 @@ STEPS = [
     ("M3 第 2c 步：KVCachePool.write", check_pool),
     ("M3 第 3a 步：build_slot_table", check_slot_table),
     ("M3 第 3b 步：paged_decode_attention", check_decode_attention),
+    ("M3 第 3c-1 步：paged_decode_layer", check_decode_layer),
+    ("M3 第 3c-2 步：paged_decode_forward", check_decode_forward),
 ]
 
 

@@ -29,7 +29,7 @@ from collections import deque
 
 import torch
 
-from miniserve.model import GPTConfig
+from miniserve.model import GPT2, CausalSelfAttention, GPTConfig
 
 
 # ---------------------------------------------------------------------------
@@ -258,4 +258,90 @@ def paged_decode_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     scores.masked_fill_(~valid[:, None, None, :], float("-inf"))
     attn = scores.softmax(dim=-1)
     return (attn @ v).transpose(1, 2).contiguous().view(B, C)
+
+
+
+# ---------------------------------------------------------------------------
+# M3 第 3c-1 步：一层的 paged decode attention（把第 2c、3a、3b 步串起来）
+#
+# 和 M2 packed_attention 的对比（都是 decode，每个请求 1 个新 token）：
+#     packed_attention：for 每个请求 { torch.cat 拼上旧缓存 → 算 attention }        kernel 数随请求数增长
+#     这里：            新 k、v 一次写进池子 → 一次读出所有请求的全部历史 → 一次算完   kernel 数和请求数无关
+#
+# 顺序很重要：【先写，后读】
+#     新 token 自己也要被自己看到（M1 里 torch.cat 之后的 k 也包含新 token）。
+#     如果先读后写，读出来的 k、v 里没有新 token，结果就错了。
+# ---------------------------------------------------------------------------
+def paged_decode_layer(attn: CausalSelfAttention, x: torch.Tensor, layer: int, pool: KVCachePool, new_slots: torch.Tensor,
+                       slot_table: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """
+    第 3c-1 步：第 layer 层、所有请求一起的 decode attention
+    attn:       你写的 CausalSelfAttention（只借用它的 c_attn、c_proj 和 n_head）
+    x:          (B, C)     每个请求这一轮新 token 的向量（已经过 ln_1）
+    layer:      第几层（整数）
+    pool:       KVCachePool，各请求之前的 k、v 已经在里面了
+    new_slots:  (B,)       每个请求的新 token 要写进哪个槽位
+    slot_table: (B, Lmax)  第 3a 步的槽位表（每个请求的长度已经算上这一轮的新 token）
+    valid:      (B, Lmax)  第 3a 步的 valid
+    返回：       (B, C)
+    """
+    # TODO ① 所有请求一起算 q、k、v：和 packed_attention 第一行一样，用 attn.c_attn(x) 再 split    → 各 (B, C)
+    #      ② 把新 token 的 k、v 写进第 layer 层的 new_slots：用你写的 pool.write
+    #      ③ 一次读出所有请求的全部历史：pool.read(layer, slot_table)                              → 各 (B, Lmax, C)
+    #           slot_table 是二维的，read 里的 self.k[layer, slots] 照样能用，结果是 (B, Lmax, C)
+    #           提示：起个和 ① 不一样的名字，比如 k_all、v_all，免得和新 token 的 k、v 搞混
+    #      ④ 用你写的 paged_decode_attention 算 attention                                         → (B, C)
+    #      ⑤ 过输出投影 attn.c_proj，返回
+    B, C = x.shape
+    q, k, v = attn.c_attn(x).split(C, dim = -1)
+    pool.write(layer, new_slots, k, v)
+    k_all, v_all = pool.read(layer, slot_table)
+    att = paged_decode_attention(q, k_all, v_all, valid, attn.n_head)
+    return attn.c_proj(att)
+
+
+# ---------------------------------------------------------------------------
+# M3 第 3c-2 步：整个模型的 paged decode 前向
+#
+# 这一步换个方式：只给目标、输入输出和可用的零件，【步骤由你自己设计】。
+#     第一步：在函数里用中文注释写出你的步骤（①②③……，每步一句话，先不写代码），写完叫我看
+#     第二步：我看过步骤后，你再把代码写在每条步骤下面
+#     卡住了随时问，我每次只给一条提示
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def paged_decode_forward(model: GPT2, tokens: torch.Tensor, positions: list[int],
+                         block_tables: list[list[int]], pool: KVCachePool) -> torch.Tensor:
+    """
+    第 3c-2 步：B 个请求各送 1 个新 token，跑完整个模型，返回每个请求下一个词的 logits
+    目标：和 M2 的 packed_forward（每个请求 seq_len = 1）算出一样的 logits，
+          但 attention 走缓存池，没有逐请求的 for 循环
+
+    model:        你写的 GPT2
+    tokens:       (B,)  每个请求这一轮的新 token id（整数张量）
+    positions:    长度为 B 的 Python 列表：每个请求的新 token 是它自己的第几个 token（从 0 开始数）
+                  比如某个请求之前已经有 5 个 token，它的新 token 位置就是 5
+    block_tables: 每个请求的块表；之前所有 token 的 k、v 已经按块表写在 pool 里了
+                  块表不一定够装新 token，不够的话直接在原来的列表上补块
+    pool:         KVCachePool（pool.block_size、pool.allocator 都可以用）
+    返回：         (B, vocab_size)
+    注意：新建的张量要放到 tokens.device 上（以后在 GPU 上跑）
+
+    可以用的零件（不一定全用上；光标放在名字上按 Ctrl+Q 看说明）：
+        本文件：ensure_blocks、slot_mapping、build_slot_table、paged_decode_layer
+        模型：  model.wte、model.wpe、model.h（每个 block 有 ln_1、attn、ln_2、mlp）、model.ln_f、model.lm_head
+        参考：  miniserve/packed.py 的 packed_forward（整体框架类似）
+    """
+    # TODO 先在这里用中文注释写出步骤，写完叫我看
+    x = model.wte(tokens) + model.wpe(torch.tensor(positions, device = tokens.device))
+    new_slots = []
+    for table, pos in zip(block_tables, positions):
+        ensure_blocks(table, pos + 1, pool.block_size, pool.allocator)
+        new_slots.append(slot_mapping(table, [pos], pool.block_size)[0])
+    new_slots = torch.tensor(new_slots, device = tokens.device)
+    slot_table, valid = build_slot_table(block_tables, [p + 1 for p in positions], pool.block_size, device = tokens.device)
+    for i, block in enumerate(model.h):
+        x = x + paged_decode_layer(block.attn, block.ln_1(x), i, pool, new_slots, slot_table, valid)
+        x = x + block.mlp(block.ln_2(x))
+    return model.lm_head(model.ln_f(x))
+
 
