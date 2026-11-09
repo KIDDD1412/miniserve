@@ -690,6 +690,51 @@ def check_decode_forward():
         run_decode_forward("cuda")             # 在 GPU 上再跑一遍：检查新建的张量有没有放对设备
 
 
+def check_prefill():
+    """第 3d 步：prefill 写进池子，再接着 decode，整条 paged 路径和 M2 的 packed_forward 逐轮对比"""
+    import torch
+    from miniserve.model import GPT2, GPTConfig, new_kv_cache
+    from miniserve.packed import packed_forward
+
+    torch.manual_seed(0)
+    cfg = GPTConfig(block_size=64, vocab_size=50, n_layer=2, n_head=2, n_embd=8)
+    model = GPT2(cfg).double().eval()
+    C, bs = cfg.n_embd, 4
+    pool = P.KVCachePool(cfg, num_blocks=16, block_size=bs, dtype=torch.float64)
+    prompt_lens = [5, 1, 8]
+    g = torch.Generator().manual_seed(1)
+    prompts = [torch.randint(0, cfg.vocab_size, (L,), generator=g).tolist() for L in prompt_lens]
+    B = len(prompts)
+
+    kv_caches = [new_kv_cache(cfg) for _ in range(B)]
+    with torch.no_grad():
+        want = packed_forward(model, torch.tensor([t for pr in prompts for t in pr]),
+                              torch.tensor([i for L in prompt_lens for i in range(L)]), prompt_lens, kv_caches)
+    tables = [[] for _ in range(B)]
+    got = P.paged_prefill_forward(model, prompts, tables, pool)
+    assert torch.allclose(got, want, atol=1e-8), "prefill 的 logits 和 packed_forward 不一样"
+    for b, L in enumerate(prompt_lens):
+        assert len(tables[b]) == P.blocks_needed(L, bs), f"请求 {b} 的块表 {tables[b]} 块数不对"
+        slots = torch.tensor(P.slot_mapping(tables[b], list(range(L)), bs))
+        for i in range(cfg.n_layer):
+            c = kv_caches[b][i]
+            assert torch.allclose(pool.k[i, slots], c.k[0].transpose(0, 1).reshape(L, C), atol=1e-10), \
+                f"请求 {b} 第 {i} 层池子里的 k 不对"
+            assert torch.allclose(pool.v[i, slots], c.v[0].transpose(0, 1).reshape(L, C), atol=1e-10), \
+                f"请求 {b} 第 {i} 层池子里的 v 不对"
+
+    lens = list(prompt_lens)
+    logits = want
+    for _ in range(6):
+        nxt = logits.argmax(dim=-1)
+        with torch.no_grad():
+            want = packed_forward(model, nxt, torch.tensor(lens), [1] * B, kv_caches)
+        got = P.paged_decode_forward(model, nxt, list(lens), tables, pool)
+        assert torch.allclose(got, want, atol=1e-8), f"prefill 之后接着 decode，位置 {lens} 这一轮的 logits 不一样"
+        lens = [L + 1 for L in lens]
+        logits = want
+
+
 STEPS = [
     ("M3 第 1a 步：blocks_needed", check_blocks_needed),
     ("M3 第 1b 步：BlockAllocator", check_allocator),
@@ -700,6 +745,7 @@ STEPS = [
     ("M3 第 3b 步：paged_decode_attention", check_decode_attention),
     ("M3 第 3c-1 步：paged_decode_layer", check_decode_layer),
     ("M3 第 3c-2 步：paged_decode_forward", check_decode_forward),
+    ("M3 第 3d 步：paged_prefill_forward", check_prefill),
 ]
 
 

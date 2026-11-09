@@ -345,3 +345,62 @@ def paged_decode_forward(model: GPT2, tokens: torch.Tensor, positions: list[int]
     return model.lm_head(model.ln_f(x))
 
 
+
+
+# ---------------------------------------------------------------------------
+# M3 第 3d 步：prefill —— 新请求的整个 prompt 跑一遍模型，每层的 k、v 写进池子
+#
+# 新请求没有历史，attention 只看自己这段 prompt（下三角 mask），不需要从池子里读；
+# 只是每层算出来的 k、v 要写进池子，留给之后的 decode 用。
+#
+# 这里的 attention 还是逐请求循环，为什么可以接受？
+#     prefill 每个请求只做一次，而且一次有几十上百个 token，每个 kernel 的计算量不小，launch 开销占比低；
+#     decode 每轮都要做、每个请求只有 1 个 token，逐请求循环的 launch 开销才是大头（八股第 31 题）
+# ---------------------------------------------------------------------------
+def _causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, n_head: int) -> torch.Tensor:
+    """一个请求自己的因果 attention：q、k、v 都是 (L, C)，返回 (L, C)"""
+    L, C = q.shape
+    hs = C // n_head
+    q, k, v = (t.view(L, n_head, hs).transpose(0, 1) for t in (q, k, v))     # 各 (nh, L, hs)
+    scores = q @ k.transpose(-2, -1) / math.sqrt(hs)                        # (nh, L, L)
+    causal = torch.ones(L, L, dtype=torch.bool, device=q.device).tril()
+    scores = scores.masked_fill(~causal, float("-inf"))
+    return (scores.softmax(dim=-1) @ v).transpose(0, 1).reshape(L, C)
+
+
+@torch.no_grad()
+def paged_prefill_forward(model: GPT2, prompts: list[list[int]], block_tables: list[list[int]],
+                          pool: KVCachePool) -> torch.Tensor:
+    """
+    第 3d 步：几个新请求一起 prefill
+    prompts:      每个请求的 prompt（token id 列表），都不能为空
+    block_tables: 每个请求的块表（新请求一般是空列表），会在原列表上补块
+    返回：         (B, vocab_size)，每个请求最后一个 token 的 logits（用来选第一个新 token）
+    """
+    device = next(model.parameters()).device
+    bs = pool.block_size
+    seq_lens = [len(p) for p in prompts]
+    assert min(seq_lens) > 0, "prompt 不能为空"
+
+    # 和层无关的准备：补块、算出所有 prompt token 的槽位（所有请求排成一排，和 M2 的 packed 一样）
+    slots = []
+    for table, L in zip(block_tables, seq_lens):
+        ensure_blocks(table, L, bs, pool.allocator)
+        slots += slot_mapping(table, list(range(L)), bs)
+    slots = torch.tensor(slots, device=device)
+    tokens = torch.tensor([t for p in prompts for t in p], device=device)
+    positions = torch.tensor([i for L in seq_lens for i in range(L)], device=device)
+
+    x = model.wte(tokens) + model.wpe(positions)                            # (N, C)
+    C = x.shape[-1]
+    for i, block in enumerate(model.h):
+        attn = block.attn
+        q, k, v = attn.c_attn(block.ln_1(x)).split(C, dim=-1)              # 各 (N, C)
+        pool.write(i, slots, k, v)                                         # 所有请求的 k、v 一次写进池子
+        ys = [_causal_attention(qq, kk, vv, attn.n_head)
+              for qq, kk, vv in zip(q.split(seq_lens), k.split(seq_lens), v.split(seq_lens))]
+        x = x + attn.c_proj(torch.cat(ys))
+        x = x + block.mlp(block.ln_2(x))
+
+    last = torch.tensor(seq_lens, device=device).cumsum(0) - 1             # 每个请求最后一个 token 在第几行
+    return model.lm_head(model.ln_f(x[last]))
