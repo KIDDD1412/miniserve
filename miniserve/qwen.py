@@ -246,7 +246,7 @@ class MLP(nn.Module):
                                (N, C)（第 ⑦ 步的 packed 路径）、(B, C)（第 ⑦ 步的 paged decode）
         返回：和 x 同形状
         """
-        # TODO（第 ⑤ 步）（形状以 x 为 (B, T, C)、C = 896、intermediate_size = 4864 为例）：
+        # 第 ⑤ 步）（形状以 x 为 (B, T, C)、C = 896、intermediate_size = 4864 为例）：
         #   ① 把 x 送进 gate_proj，再过 SiLU 激活，得到"阀门"      (B, T, 4864)      零件：self.gate_proj、F.silu
         #   ② 把 x 送进 up_proj                                     (B, T, 4864)      零件：self.up_proj
         #   ③ 两者逐个元素相乘                                      (B, T, 4864)      零件：*
@@ -255,7 +255,11 @@ class MLP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 第 ⑥ 步：一个 decoder 层（对应 HF 的 model.layers.N），和整个模型 —— 第 ⑥ 步时再补全说明
+# 第 ⑥a 步：一个 decoder 层（对应 HF 的 model.layers.N，一共 24 个）
+#   和 GPT-2 的 Block 结构完全一样（pre-norm + 两个残差），只是零件换了名字：
+#       GPT-2：  x = x + attn( ln_1(x) )                 x = x + mlp( ln_2(x) )
+#       Qwen2：  x = x + self_attn( input_layernorm(x) )  x = x + mlp( post_attention_layernorm(x) )
+#   不同的是 self_attn 多要两个参数 cos、sin（RoPE 在 attention 里面转 q、k）
 # ---------------------------------------------------------------------------
 class DecoderLayer(nn.Module):
     def __init__(self, config: QwenConfig) -> None:
@@ -267,10 +271,30 @@ class DecoderLayer(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cache=None) -> torch.Tensor:
-        """x: (B, T, C) -> (B, T, C)"""
-        raise NotImplementedError
+        """
+        x:        固定 3 维 (B, T, C)
+        cos, sin: (T, head_dim)，原样传给 self_attn
+        cache:    None，或者这一层的 LayerKVCache，原样传给 self_attn
+        返回：     (B, T, C)
+        """
+        # TODO（第 ⑥a 步）：
+        #   ① x 先过 input_layernorm，再送进 self_attn（带上 cos、sin、cache），结果加回 x      (B, T, C)
+        #   ② x 先过 post_attention_layernorm，再送进 mlp，结果加回 x                          (B, T, C)
+        #   ③ 返回 x
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin, cache = cache)
+        x = x + self.mlp(self.post_attention_layernorm(x))
+        return x
 
 
+
+# ---------------------------------------------------------------------------
+# 第 ⑥b 步：整个模型（对应 HF 的 Qwen2ForCausalLM）
+#   idx (B, T)：token id
+#     -> embed_tokens(idx)                  (B, T, C)       没有 wpe：位置信息在每层的 attention 里由 RoPE 加
+#     -> 24 个 DecoderLayer                 (B, T, C)       每层都用同一份 cos、sin（只在进层之前算一次）
+#     -> norm                               (B, T, C)
+#     -> lm_head                            (B, T, vocab_size)
+# ---------------------------------------------------------------------------
 class Qwen2(nn.Module):
     def __init__(self, config: QwenConfig) -> None:
         super().__init__()
@@ -283,9 +307,72 @@ class Qwen2(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight        # 和 GPT-2 一样共享权重
 
-    def forward(self, idx: torch.Tensor, kv_cache=None) -> torch.Tensor:
-        """idx: (B, T) 的 token id -> logits (B, T, vocab_size)"""
-        raise NotImplementedError
+    def forward(self, idx: torch.Tensor, kv_cache: list | None = None) -> torch.Tensor:
+        """
+        idx:      固定 2 维 (B, T) 的 token id（整数）
+        kv_cache: None，或者 new_kv_cache(config) 建的列表（每层一个 LayerKVCache，第 i 层用第 i 个）
+        返回：     logits (B, T, vocab_size)
+        """
+        # （第 ⑥b 步）（形状以 C = 896、head_dim = 64 为例）：
+        #   ① 算出已经缓存了几个 token（past）：没传缓存、或者缓存还是空的时候是 0          照 M1 的 GPT2.forward
+        #   ② 生成这次 T 个 token 的位置 past, past + 1, …, past + T − 1                   (T,)       零件：torch.arange（放在 idx 的设备上）
+        #   ③ 用位置算出 cos、sin                                                         (T, 64)    零件：rope_cos_sin，参数从 self.config 里拿
+        #   ④ idx 送进 embed_tokens 得到 x                                                (B, T, 896)
+        #   ⑤ 把 cos、sin 转成和 x 一样的类型（现在都是 float32，看不出区别；⑧ 测速用 bf16 时必须有这一步）
+        #                                                                                 零件：cos.to(x.dtype)
+        #   ⑥ 依次过 24 个 DecoderLayer，第 i 层传第 i 层的缓存（没传 kv_cache 时每层传 None） 照 M1 的 GPT2.forward
+        #   ⑦ 过 norm，再过 lm_head，返回                                                  (B, T, vocab_size)
+        B, T = idx.size()
+        if kv_cache is not None and kv_cache[0].k is not None:
+            past = kv_cache[0].k.size(2)
+        else:
+            past = 0
+        pos = torch.arange(past, past + T, device=idx.device)
+        cos, sin = rope_cos_sin(pos, self.config.head_dim, self.config.rope_theta)
+        x = self.embed_tokens(idx)
+        cos = cos.to(x.dtype)
+        sin = sin.to(x.dtype)
+        for i ,layer in enumerate(self.layers):
+            layercache = None if kv_cache is None else kv_cache[i]
+            x = layer(x, cos, sin, layercache)
+        return self.lm_head(self.norm(x))
+
+
+
+def new_kv_cache(config: QwenConfig) -> list:
+    """给整个模型建一份空缓存：每层一个 M1 的 LayerKVCache（GPT-2 的 new_kv_cache 读的是 config.n_layer，这里字段名不一样）"""
+    from miniserve.model import LayerKVCache
+
+    return [LayerKVCache() for _ in range(config.num_hidden_layers)]
+
+
+# ---------------------------------------------------------------------------
+# 第 ⑥c 步：带 KV Cache 的贪心解码（和 M1 的 generate_cached 一样）
+#   prefill：整个 prompt 一次送进去，顺便填满每层的缓存
+#   decode ：之后每轮只送 1 个新 token
+#   这里不管 eos（生成结束符），固定生成 max_new_tokens 个，方便和 HF 逐 token 对比
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def generate(model: Qwen2, idx: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
+    """
+    idx: 固定 2 维 (B, T) 的 token id
+    返回：(B, T + max_new_tokens)，前 T 个就是 idx
+    """
+    # TODO（第 ⑥c 步）：
+    #   ① 建一份空缓存                                                       零件：new_kv_cache(model.config)
+    #   ② prefill：整个 idx 带着缓存送进 model，得到 logits                   (B, T, vocab_size)
+    #   ③ 循环 max_new_tokens 次：
+    #        从 logits 的最后一个位置选出分数最高的 next_id                    (B, 1)       零件：argmax(dim=-1, keepdim=True)
+    #        拼到 idx 后面                                                    (B, 当前长度 + 1)
+    #        只把 next_id 带着缓存送进 model，得到下一轮的 logits              (B, 1, vocab_size)
+    #   ④ 返回 idx
+    kv_cache = new_kv_cache(model.config)
+    logits = model(idx, kv_cache)
+    for _ in range(max_new_tokens):
+        next_id = logits[:, -1, :].argmax(dim = -1, keepdim = True)
+        idx = torch.cat([idx, next_id], dim = -1)
+        logits = model(next_id, kv_cache)
+    return idx
 
 
 # ---------------------------------------------------------------------------

@@ -522,6 +522,212 @@ def check_mlp() -> float:
     return max(errs)
 
 
+# ---------------------------------------------------------------------------
+# 第 ⑥ 步：整个模型（和 HF 的 Qwen2ForCausalLM 比）
+# ---------------------------------------------------------------------------
+PROMPTS = ["The capital of France is", "def fibonacci(n):\n   "]   # 两句都是 5 个 token，可以拼成 B = 2
+
+
+@functools.cache
+def hf_model():
+    from transformers import AutoModelForCausalLM
+
+    return AutoModelForCausalLM.from_pretrained(Q.QWEN_NAME, dtype=torch.float32).eval()
+
+
+@functools.cache
+def tokenizer():
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(Q.QWEN_NAME)
+
+
+def prompt_ids() -> torch.Tensor:
+    rows = [tokenizer()(p).input_ids for p in PROMPTS]
+    assert len({len(r) for r in rows}) == 1, "检查脚本自己的问题：两个 prompt 的 token 数不一样"
+    return torch.tensor(rows)
+
+
+@functools.cache
+def hf_outputs():
+    """HF 跑一遍 prompt：logits 和每层的隐藏状态（hidden_states[0] 是嵌入，[i + 1] 是第 i 层的输出）"""
+    with torch.no_grad():
+        out = hf_model()(prompt_ids(), output_hidden_states=True)
+    return out.logits, out.hidden_states
+
+
+def _layer_wrong_versions(layer, x, cos, sin):
+    a, m = layer.self_attn, layer.mlp
+    n1, n2 = layer.input_layernorm, layer.post_attention_layernorm
+    cands = []
+    h = x + a(n1(x), cos, sin); cands.append(("少了 MLP 那个残差：x = x + mlp(...)，不是 x = mlp(...)", m(n2(h))))
+    h = a(n1(x), cos, sin); cands.append(("少了 attention 那个残差：x = x + self_attn(...)，不是 x = self_attn(...)", h + m(n2(h))))
+    h = a(n1(x), cos, sin); cands.append(("两个残差都少了", m(n2(h))))
+    h = x + a(n1(x), cos, sin); cands.append(("MLP 前面没过 post_attention_layernorm", h + m(h)))
+    h = x + a(x, cos, sin); cands.append(("attention 前面没过 input_layernorm", h + m(n2(h))))
+    h = x + a(n1(x), cos, sin); cands.append(("两个 norm 用反了 / 第二个也用了 input_layernorm", h + m(n1(h))))
+    h = n1(x); h = h + a(h, cos, sin); cands.append(("残差加的是 norm 之后的 x：要先 h = norm(x) 只送进 attention，加回去的是原来的 x", h + m(n2(h))))
+    h = n1(x + a(x, cos, sin)); cands.append(("写成了 post-norm（先加残差再 norm）：Qwen 和 GPT-2 一样是 pre-norm", n2(h + m(h))))
+    h = x + m(n2(x)); cands.append(("attention 和 MLP 的顺序反了：先 attention、后 MLP", h + a(n1(h), cos, sin)))
+    h = x + a(n1(x), sin, cos); cands.append(("cos、sin 传反了：self_attn 的参数顺序是 (x, cos, sin, cache)", h + m(n2(h))))
+    return cands
+
+
+def check_decoder_layer() -> float:
+    """我们的第 i 层，输入 HF 的 hidden_states[i]，输出应该等于 HF 的 hidden_states[i + 1]"""
+    from miniserve.model import LayerKVCache
+
+    model, cfg = our_model(), our_model().config
+    _, hs = hf_outputs()
+    T = hs[0].shape[1]
+    cos, sin = hf_cos_sin(torch.arange(T), cfg.head_dim, cfg.rope_theta)
+    errs = []
+    with torch.no_grad():
+        for i in [0, 1, 12, cfg.num_hidden_layers - 2]:    # 最后一层的输出在 HF 里已经过了 norm，不拿来比
+            layer, x, want = model.layers[i], hs[i], hs[i + 1]
+            name = f"第 {i} 层的输出"
+            try:
+                got = layer(x, cos, sin)
+            except NotImplementedError:
+                raise
+            except TypeError as e:
+                raise AssertionError(f"{name}：调用出错（{e}）。self_attn 要传 4 个东西：norm 后的 x、cos、sin、cache") from None
+            try:
+                errs.append(compare(name, got, want, rtol=1e-4))
+            except AssertionError:
+                if isinstance(got, torch.Tensor):
+                    for hint, wrong in _layer_wrong_versions(layer, x, cos, sin):
+                        if wrong.shape == got.shape and torch.allclose(got, wrong, rtol=1e-4, atol=1e-3):
+                            raise AssertionError(f"{name} 和 HF 不一致：{hint}") from None
+                raise
+
+        # 带缓存：分两次送（3 个 + 2 个），拼起来应该和一次送一样
+        layer, x, want = model.layers[1], hs[1], hs[2]
+        cache = LayerKVCache()
+        outs = [layer(x[:, :3], cos[:3], sin[:3], cache=cache)]
+        assert cache.k is not None, "第 1 层传了 cache，但 cache.k 还是 None：cache 要原样传给 self_attn"
+        outs.append(layer(x[:, 3:], cos[3:], sin[3:], cache=cache))
+        errs.append(compare("第 1 层的输出（带缓存，分 2 次送）", torch.cat(outs, dim=1), want, rtol=1e-4))
+    return max(errs)
+
+
+def _tiny_model(dtype: torch.dtype, device: str = "cpu") -> "Q.Qwen2":
+    """2 层、随机权重的小 Qwen2：只用来检查类型 / 设备，不看数值"""
+    import dataclasses
+
+    cfg = dataclasses.replace(our_model().config, num_hidden_layers=2, vocab_size=64)
+    return Q.Qwen2(cfg).to(device=device, dtype=dtype).eval()
+
+
+def check_model_forward() -> float:
+    model = our_model()
+    idx = prompt_ids()
+    want, hs = hf_outputs()
+    with torch.no_grad():
+        try:
+            got = model(idx)
+        except NotImplementedError:
+            raise
+        except TypeError as e:
+            raise AssertionError(f"调用出错（{e}）。rope_cos_sin 要 3 个参数：位置、head_dim、theta；"
+                                 "每层要传 x、cos、sin、cache") from None
+        try:
+            err = compare("logits（不带缓存）", got, want, rtol=1e-4)
+        except AssertionError:
+            if isinstance(got, torch.Tensor) and got.shape == want.shape:
+                # 没过 norm：用我们自己的层跑一遍，最后不过 norm
+                cfg = model.config
+                cos, sin = hf_cos_sin(torch.arange(idx.shape[1]), cfg.head_dim, cfg.rope_theta)
+                x = model.embed_tokens(idx)
+                for layer in model.layers:
+                    x = layer(x, cos, sin)
+                if torch.allclose(got, model.lm_head(x), rtol=1e-4, atol=1e-3):
+                    raise AssertionError("logits 和 HF 不一致：lm_head 前面少了 self.norm") from None
+                for theta in (1e4, 1e6):
+                    if theta == cfg.rope_theta:
+                        continue
+                    c2, s2 = hf_cos_sin(torch.arange(idx.shape[1]), cfg.head_dim, theta)
+                    x = model.embed_tokens(idx)
+                    for layer in model.layers:
+                        x = layer(x, c2, s2)
+                    if torch.allclose(got, model.lm_head(model.norm(x)), rtol=1e-4, atol=1e-3):
+                        raise AssertionError("logits 和 HF 不一致：theta 写死了，要用 self.config.rope_theta") from None
+            raise
+
+        # 带缓存：分 3 次送（2 / 1 / 2 个），拼起来应该和一次送一样
+        kv = Q.new_kv_cache(model.config)
+        outs = [model(idx[:, a:b], kv_cache=kv) for a, b in [(0, 2), (2, 3), (3, 5)]]
+        assert kv[0].k is not None and kv[-1].k is not None, "传了 kv_cache，但缓存还是空的：第 i 层要传 kv_cache[i]"
+        assert kv[0].k.shape[2] == idx.shape[1], (
+            f"送完 {idx.shape[1]} 个 token 后，第 0 层缓存里应该有 {idx.shape[1]} 个，实际 {kv[0].k.shape[2]} 个")
+        try:
+            err = max(err, compare("logits（带缓存，分 3 次送）", torch.cat(outs, dim=1), want, rtol=1e-4))
+        except AssertionError as e:
+            raise AssertionError(f"{e}。不带缓存是对的，问题在带缓存的部分：位置有没有从 past 开始数？"
+                                 "（第二次送的 token 位置是 2，不是 0）") from None
+
+    # 设备：在 "meta" 设备上跑一遍（不真正算），位置没放在 idx 的设备上会出错
+    tiny = _tiny_model(torch.float32, "meta")
+    try:
+        tiny(torch.zeros(1, 3, dtype=torch.long, device="meta"))
+    except RuntimeError as e:
+        raise AssertionError(f"idx 在别的设备上时出错（{e}）。arange 要加 device=idx.device") from None
+
+    # 类型：bf16 的模型，logits 也应该是 bf16（第 ⑧ 步测速要用）
+    tiny = _tiny_model(torch.bfloat16)
+    with torch.no_grad():
+        try:
+            out = tiny(torch.tensor([[1, 2, 3]]))
+        except RuntimeError as e:
+            raise AssertionError(f"模型是 bf16 时出错（{e}）。cos、sin 是 float32，要先转成 x 的类型：cos.to(x.dtype)") from None
+    assert out.dtype == torch.bfloat16, (f"模型是 bf16 时，logits 应该也是 bf16，实际是 {out.dtype}。"
+                                          "cos、sin 是 float32，要先转成 x 的类型：cos.to(x.dtype)")
+    return err
+
+
+def check_generate() -> None:
+    from transformers import GenerationConfig
+
+    model, tok = our_model(), tokenizer()
+    N = 20
+    idx = prompt_ids()
+
+    # 记录每次调用 model 时送进去几个 token，用来检查有没有用缓存
+    lens = []
+    hook = model.register_forward_pre_hook(lambda m, args, kwargs: lens.append(args[0].shape[1]), with_kwargs=True)
+    try:
+        got = Q.generate(model, idx, N)
+    except NotImplementedError:
+        raise
+    except RuntimeError as e:
+        raise AssertionError(f"运行出错（{e}）。next_id 应该是 (B, 1)：要先取最后一个位置 logits[:, -1, :]，再 argmax；"
+                             "直接对 (B, T, vocab) 的 logits 做 argmax 得到的是 (B, T, 1)，拼不到 (B, T) 的 idx 后面") from None
+    finally:
+        hook.remove()
+    assert isinstance(got, torch.Tensor), f"generate 应该返回 Tensor，实际是 {type(got).__name__}（是不是忘了 return？）"
+    assert got.shape == (idx.shape[0], idx.shape[1] + N), (
+        f"generate 返回的形状应为 {(idx.shape[0], idx.shape[1] + N)}，实际是 {tuple(got.shape)}")
+    assert torch.equal(got[:, :idx.shape[1]], idx), "返回结果的前面几个 token 应该就是 prompt"
+    assert lens and lens[0] == idx.shape[1], f"第一次调用 model 应该送整个 prompt（{idx.shape[1]} 个 token），实际送了 {lens[:1]}"
+    assert all(n == 1 for n in lens[1:]), (
+        f"prefill 之后每次应该只送 1 个新 token，实际每次送的个数是 {lens}（是不是每次都送了整个 idx，没用缓存？）")
+
+    with torch.no_grad():
+        want = hf_model().generate(idx, attention_mask=torch.ones_like(idx), generation_config=GenerationConfig(
+            do_sample=False, max_new_tokens=N, eos_token_id=None, pad_token_id=tok.eos_token_id))
+    for b in range(idx.shape[0]):
+        same = (got[b] == want[b]).tolist()
+        if not all(same):
+            k = same.index(False)
+            raise AssertionError(f"第 {b} 个请求的第 {k - idx.shape[1] + 1} 个生成的 token 和 HF 不一样："
+                                 f"我们 {got[b, k].item()}，HF {want[b, k].item()}"
+                                 "（如果第 1 个就不一样：选 next_id 时取的是不是最后一个位置 logits[:, -1, :]？）")
+    print(f"         {idx.shape[0]} 个请求 × {N} 个 token，和 HF 逐 token 一致；调用 model {len(lens)} 次，"
+          f"每次送的 token 数 {lens[0]}, 1, 1, …")
+    for b in range(idx.shape[0]):
+        print(f"         [{b}] {tok.decode(got[b])!r}")
+
+
 STEPS = [
     ("第 ①a 步 config", check_config),
     ("第 ①b 步 from_pretrained", check_from_pretrained),
@@ -531,6 +737,9 @@ STEPS = [
     ("第 ③c 步 相对位置性质（演示）", check_rope_relative),
     ("第 ④ 步 GQA attention", check_attention),
     ("第 ⑤ 步 SwiGLU MLP", check_mlp),
+    ("第 ⑥a 步 DecoderLayer", check_decoder_layer),
+    ("第 ⑥b 步 Qwen2.forward", check_model_forward),
+    ("第 ⑥c 步 generate（贪心解码，和 HF 逐 token 对比）", check_generate),
 ]
 
 
